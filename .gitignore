@@ -1,0 +1,7 @@
+wandb/
+test/
+logs/
+train/trush/
+eval/logs/
+datasets/libero/data/
+ckpts/
