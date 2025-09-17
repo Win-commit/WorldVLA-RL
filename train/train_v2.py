@@ -18,10 +18,14 @@ import deepspeed
 import json
 # import logging
 # logging.getLogger("transformers").setLevel(logging.DEBUG)
-
+import threading
+import queue
+import uuid
+import time
 import websockets
 import asyncio
 import numpy as np
+import pickle  # 添加pickle用于二进制序列化
 
 os.environ["WANDB_BASE_URL"] = "https://api.bandw.top"
 
@@ -37,6 +41,9 @@ class ModelArguments:
     p: float = field(default=0.85, metadata={"help": "stage2执行奖励采样的概率"})
     gamma: float = field(default=0.9, metadata={"help": "时间加权参数(stage2专用)"})
     noise_factor: float = field(default=0.1, metadata={"help": "噪声因子(stage2专用)"})
+    # 添加环境模型服务器配置
+    env_servers: str = field(default="localhost:8765", 
+                         metadata={"help": "环境模型服务器列表，格式为'host1:port1,host2:port2,...'"})
 
 
 @dataclass
@@ -67,25 +74,42 @@ class TrainingArguments(HFTrainingArguments):
 
 
 class EnvModelClient:
-    def __init__(self, host="localhost", port=8765, rank=0, max_retries=5):
-        # 所有进程连接到相同端口
+    def __init__(self, servers=None, rank=0, max_retries=5):
+        """
+        初始化环境模型客户端
+        
+        参数:
+            servers: 服务器列表，每个元素为(host, port)元组，例如[("localhost", 8765), ("localhost", 8766)]
+                     如果为None，则默认使用[("localhost", 8765)]
+            rank: 当前进程的rank
+            max_retries: 最大重试次数
+        """
+        if servers is None:
+            servers = [("localhost", 8765)]
+        
+        # 根据rank选择要连接的服务器
+        server_idx = rank % len(servers)
+        host, port = servers[server_idx]
         self.uri = f"ws://{host}:{port}"
+        
         self.max_retries = max_retries
         self.rank = rank
-        # 保留最小延迟用于重试，但不再根据rank错开时间
-        self.retry_delay = 2.0  # 重试延迟降低到2秒
-        print(f"Rank {rank} 使用 WebSocket 连接: {self.uri}, 重试延迟: {self.retry_delay}秒")
+        self.retry_delay = 2.0  
+        
+        print(f"Rank {rank} 分配到服务器 {host}:{port}, URI: {self.uri}, 重试延迟: {self.retry_delay}秒")
         
     async def sample_rewards_async(self, text_ids_list, image_token_ids, states):
         
         for attempt in range(self.max_retries):
             try:
-                # 准备数据 - 完整保留所有原始数据
                 data = {
-                    'text_ids_list': [ids.cpu().numpy().tolist() for ids in text_ids_list],
-                    'image_token_ids': image_token_ids.cpu().numpy().tolist(),
-                    'states': states.cpu().to(torch.float32).numpy().tolist()
+                    'text_ids_list': [ids.cpu().numpy() for ids in text_ids_list],
+                    'image_token_ids': image_token_ids.cpu().numpy(),
+                    'states': states.cpu().to(torch.float32).numpy()
                 }
+                
+                # 使用pickle二进制序列化
+                binary_data = pickle.dumps(data)
                 
                 # 连接服务器时添加兼容性设置和超时参数
                 async with websockets.connect(
@@ -96,12 +120,18 @@ class EnvModelClient:
                     ping_interval=None,      # 禁用ping
                     compression=None         # 不使用压缩
                 ) as websocket:
-                    # 发送数据
-                    await websocket.send(json.dumps(data))
+                    # 发送二进制数据
+                    await websocket.send(binary_data)
                     
-                    # 接收结果
-                    response = await websocket.recv()
-                    results = json.loads(response)
+                    # 接收二进制结果
+                    binary_response = await websocket.recv()
+                    # 使用字节类型进行反序列化，确保兼容性
+                    if isinstance(binary_response, str):
+                        # 如果返回的是字符串，可能是旧版服务器返回的JSON
+                        results = json.loads(binary_response)
+                    else:
+                        # 否则作为二进制数据处理
+                        results = pickle.loads(binary_response)
                     
                     # 转换回PyTorch张量，并确保使用正确的数据类型
                     device = image_token_ids.device
@@ -122,15 +152,13 @@ class EnvModelClient:
                         group_start = context_len_i + best_idx * (reward_group_size + 1)  # +1 for rtg
                         group_end = group_start + reward_group_size + 1  # +1 for rtg
                         
-
-                        critical_segment = torch.tensor(critical_segments[i], dtype=dtype, device=device)
+                        critical_segment = torch.from_numpy(critical_segments[i]).to(device=device, dtype=dtype)
                         hidden_states[i:i+1, group_start:group_end, :] = critical_segment
-
                     
                     # 构建完整的reward_results，包含所有必要的数据
                     reward_results = {
-                        'reward_preds_group_mean': torch.tensor(results['reward_preds_group_mean'], dtype=dtype).to(device),
-                        'best_reward_group': torch.tensor(results['best_reward_group'], dtype=torch.long).to(device),
+                        'reward_preds_group_mean': torch.from_numpy(results['reward_preds_group_mean']).to(device=device, dtype=dtype),
+                        'best_reward_group': torch.from_numpy(results['best_reward_group']).to(device=device, dtype=torch.long),
                         'hidden_states': hidden_states,  # 添加恢复的hidden_states
                         'context_lengths': results['context_lengths'],  # 添加context_lengths
                         'noise_norm': results['noise_norm'],
@@ -164,13 +192,11 @@ class EnvModelClient:
         finally:
             loop.close()
 
-
 class Stage2DualModelTrainer(Trainer):
-    """Stage2专用的双模型训练器，一个环境模型(冻结)负责采样奖励，一个动作生成模型负责生成动作"""
 
     def __init__(
         self,
-        env_model_client,  # 改为客户端
+        env_model_client,  
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -262,7 +288,7 @@ class Stage2DualModelTrainer(Trainer):
             loss = outputs["action_ce_loss"]
             
             # 记录训练指标
-            if hasattr(self, "log"):
+            if hasattr(self, "log") and return_outputs:
                 log_data = {
                     "action_ce_loss": outputs["action_ce_loss"].item(),
                 }
@@ -328,7 +354,8 @@ def main():
                 "reward_group_size": model_args.reward_group_size,
                 "p": model_args.p,
                 "gamma": model_args.gamma,
-                "noise_factor": model_args.noise_factor
+                "noise_factor": model_args.noise_factor,
+                "env_servers": model_args.env_servers
             }
         )
 
@@ -339,9 +366,22 @@ def main():
         trust_remote_code=True,
     )
 
+    # 解析环境模型服务器配置
+    servers = []
+    for server_config in model_args.env_servers.split(","):
+        if ":" in server_config:
+            host, port_str = server_config.strip().split(":")
+            port = int(port_str)
+            servers.append((host, port))
+        else:
+            # 如果没有指定端口，使用默认端口
+            servers.append((server_config.strip(), 8765))
+    
+    print(f"使用环境模型服务器列表: {servers}")
+
     # 创建环境模型客户端而不是直接加载模型
     rank = getattr(training_args, 'local_rank', 0)
-    env_model_client = EnvModelClient(host="localhost", port=8765, rank=rank)
+    env_model_client = EnvModelClient(servers=servers, rank=rank)
     
     # 加载动作生成模型 (要训练的模型)
     actor_model_path = model_args.actor_model_path
@@ -379,8 +419,6 @@ def main():
     if training_args.report_to and "wandb" in training_args.report_to:
         callbacks.append(WandbLoggingCallback())
     
-    with open(training_args.deepspeed) as f:
-            ds_config = json.load(f)
 
     # Initialize trainer with both models
     trainer = Stage2DualModelTrainer(
