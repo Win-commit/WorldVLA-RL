@@ -28,8 +28,6 @@ os.environ["WANDB_BASE_URL"] = "https://api.bandw.top"
 
 @dataclass
 class ModelArguments:
-    env_model_path: str = field(default="/liujinxin/zhy/ICLR2026/logs/STAGE1_TRAINER/checkpoint-8000", 
-                              metadata={"help": "环境模型路径(使用stage1权重)"})
     actor_model_path: str = field(default="", 
                               metadata={"help": "动作生成模型路径(可选，如果为空则使用env_model_path初始化)"})
     stage: str = field(default="stage2", metadata={"help": "训练阶段: stage1 或 stage2"})
@@ -69,44 +67,102 @@ class TrainingArguments(HFTrainingArguments):
 
 
 class EnvModelClient:
-    def __init__(self, host="localhost", port=8765):
+    def __init__(self, host="localhost", port=8765, rank=0, max_retries=5):
+        # 所有进程连接到相同端口
         self.uri = f"ws://{host}:{port}"
+        self.max_retries = max_retries
+        self.rank = rank
+        # 保留最小延迟用于重试，但不再根据rank错开时间
+        self.retry_delay = 2.0  # 重试延迟降低到2秒
+        print(f"Rank {rank} 使用 WebSocket 连接: {self.uri}, 重试延迟: {self.retry_delay}秒")
         
     async def sample_rewards_async(self, text_ids_list, image_token_ids, states):
-        # 准备数据
-        data = {
-            'text_ids_list': [ids.cpu().numpy().tolist() for ids in text_ids_list],
-            'image_token_ids': image_token_ids.cpu().numpy().tolist(),
-            'states': states.cpu().numpy().tolist()
-        }
         
-        async with websockets.connect(self.uri) as websocket:
-            # 发送数据
-            await websocket.send(json.dumps(data))
-            
-            # 接收结果
-            response = await websocket.recv()
-            results = json.loads(response)
-            
-            # 转换回PyTorch张量
-            device = image_token_ids.device
-            reward_results = {
-                'reward_preds_group_mean': torch.tensor(results['reward_preds_group_mean']).to(device),
-                'best_reward_group': torch.tensor(results['best_reward_group']).to(device),
-                'noise_norm': results['noise_norm'],
-                'reward_embedding_norm': results['reward_embedding_norm'],
-                'rwd_noise_ratio': results['rwd_noise_ratio'],
-                'rtg_noise_ratio': results['rtg_noise_ratio']
-            }
-            
-            return reward_results
+        for attempt in range(self.max_retries):
+            try:
+                # 准备数据 - 完整保留所有原始数据
+                data = {
+                    'text_ids_list': [ids.cpu().numpy().tolist() for ids in text_ids_list],
+                    'image_token_ids': image_token_ids.cpu().numpy().tolist(),
+                    'states': states.cpu().to(torch.float32).numpy().tolist()
+                }
+                
+                # 连接服务器时添加兼容性设置和超时参数
+                async with websockets.connect(
+                    self.uri,
+                    max_size=1024*1024*500,  # 500MB
+                    open_timeout=300,        # 5分钟超时
+                    close_timeout=300,       # 5分钟超时
+                    ping_interval=None,      # 禁用ping
+                    compression=None         # 不使用压缩
+                ) as websocket:
+                    # 发送数据
+                    await websocket.send(json.dumps(data))
+                    
+                    # 接收结果
+                    response = await websocket.recv()
+                    results = json.loads(response)
+                    
+                    # 转换回PyTorch张量，并确保使用正确的数据类型
+                    device = image_token_ids.device
+                    dtype = torch.bfloat16
+                    
+                    # 仅从关键片段重构必要的hidden_states
+                    hidden_states_shape = results['hidden_states_shape']
+                    context_lengths = results['context_lengths']
+                    best_reward_group = results['best_reward_group']
+                    critical_segments = results['critical_segments']
+                    reward_group_size = results['reward_group_size']
+                    
+                    hidden_states = torch.zeros(hidden_states_shape, dtype=dtype, device=device)
+                    
+                    for i in range(len(context_lengths)):
+                        context_len_i = context_lengths[i]
+                        best_idx = best_reward_group[i]
+                        group_start = context_len_i + best_idx * (reward_group_size + 1)  # +1 for rtg
+                        group_end = group_start + reward_group_size + 1  # +1 for rtg
+                        
+
+                        critical_segment = torch.tensor(critical_segments[i], dtype=dtype, device=device)
+                        hidden_states[i:i+1, group_start:group_end, :] = critical_segment
+
+                    
+                    # 构建完整的reward_results，包含所有必要的数据
+                    reward_results = {
+                        'reward_preds_group_mean': torch.tensor(results['reward_preds_group_mean'], dtype=dtype).to(device),
+                        'best_reward_group': torch.tensor(results['best_reward_group'], dtype=torch.long).to(device),
+                        'hidden_states': hidden_states,  # 添加恢复的hidden_states
+                        'context_lengths': results['context_lengths'],  # 添加context_lengths
+                        'noise_norm': results['noise_norm'],
+                        'reward_embedding_norm': results['reward_embedding_norm'],
+                        'rwd_noise_ratio': results['rwd_noise_ratio'],
+                        'rtg_noise_ratio': results['rtg_noise_ratio']
+                    }
+                    
+                    return reward_results
+                    
+            except Exception as e:
+                delay = self.retry_delay * (2 ** attempt)  # 指数退避策略
+                print(f"Rank {self.rank} WebSocket错误 (尝试 {attempt+1}/{self.max_retries}, 将在{delay}秒后重试): {str(e)[:200]}...")
+                
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(delay + 0.1 * self.rank)  # 添加rank相关的延迟避免同步重试
+                else:
+                    # 如果多次尝试失败，直接抛出异常
+                    print(f"Rank {self.rank} 连接失败，已尝试 {self.max_retries} 次，终止训练")
+                    raise
     
     def sample_rewards(self, text_ids_list, image_token_ids, states):
-        # 同步包装
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.sample_rewards_async(text_ids_list, image_token_ids, states)
-        )
+        # 创建新的事件循环避免冲突
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                self.sample_rewards_async(text_ids_list, image_token_ids, states)
+            )
+            return result
+        finally:
+            loop.close()
 
 
 class Stage2DualModelTrainer(Trainer):
@@ -120,13 +176,6 @@ class Stage2DualModelTrainer(Trainer):
         super().__init__(**kwargs)
         self.env_model_client = env_model_client
         self.actor_model = self.model  
-
-        # 冻结环境模型的所有参数
-        for param in self.env_model_client.model.parameters():
-            param.requires_grad = False
-
-        # 确保环境模型处于评估模式
-        self.env_model_client.model.eval()
         
 
     def get_train_dataloader(self):
@@ -192,7 +241,16 @@ class Stage2DualModelTrainer(Trainer):
         
         # 2. 使用动作生成模型(actor_model)生成动作
         if len(action_token_ids) > 0:
-            action_token_ids = [x.to(device, non_blocking=True) for x in action_token_ids]
+            # 检查并正确处理action_token_ids
+            if isinstance(action_token_ids[0], list):
+                # 如果是嵌套列表，每个内部元素转换为tensor
+                action_token_ids = [[tensor.to(device, non_blocking=True) if isinstance(tensor, torch.Tensor) else 
+                                    torch.tensor(tensor, device=device) for tensor in action_group] 
+                                    for action_group in action_token_ids]
+            else:
+                # 直接将列表中的每个张量移动到设备
+                action_token_ids = [x.to(device, non_blocking=True) if isinstance(x, torch.Tensor) else
+                                    torch.tensor(x, device=device) for x in action_token_ids]
             outputs = self.actor_model.generate_actions(
                 text_ids_list=text_ids_list,
                 image_token_ids=image_token_ids,
@@ -256,7 +314,6 @@ def main():
             project=training_args.exp_name,
             name=f"training_{training_args.run_name or 'default'}",
             config={
-                "env_model_path": model_args.env_model_path,
                 "actor_model_path": model_args.actor_model_path,
                 "data_path": data_args.data_path,
                 "learning_rate": training_args.learning_rate,
@@ -277,16 +334,17 @@ def main():
 
     # Load tokenizer
     tokenizer = Emu3Tokenizer.from_pretrained(
-        model_args.env_model_path,
+        model_args.actor_model_path,
         model_max_length=training_args.max_position_embeddings,
         trust_remote_code=True,
     )
 
     # 创建环境模型客户端而不是直接加载模型
-    env_model_client = EnvModelClient(host="localhost", port=8765)
+    rank = getattr(training_args, 'local_rank', 0)
+    env_model_client = EnvModelClient(host="localhost", port=8765, rank=rank)
     
     # 加载动作生成模型 (要训练的模型)
-    actor_model_path = model_args.actor_model_path if model_args.actor_model_path else model_args.env_model_path
+    actor_model_path = model_args.actor_model_path
     actor_config = Emu3RewardConfig.from_pretrained(actor_model_path)
     actor_model = Emu3UnifiedRewardModel.from_pretrained(
         actor_model_path,

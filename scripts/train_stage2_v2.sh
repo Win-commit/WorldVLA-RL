@@ -14,7 +14,8 @@ STAGE=${1:-stage2}
 EXP_NAME="STAGE2_TRAINER_STAGE1EMABalance_StateNorm_EnvActor"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
+ENV_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE1_TRAINER_Balance_Loss_StateNorm/checkpoint-200
+ACTOR_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE2_TRAINER_STAGE1EMABalance_StateNorm_warmup/checkpoint-300
 # 设置STAGE特定参数
 if [ "$STAGE" = "stage1" ]; then
     STAGE_ARGS="--stage stage1 --parallel_mode False"
@@ -24,12 +25,15 @@ else
     FRAMES=1
 fi
 
+python train/env_model_server.py --model_path ${ENV_MODEL_PATH} &
+SERVER_PID=$!
+sleep 30
+
 torchrun \
     --nproc_per_node=${NGPUS} \
     --nnodes=${WORLD_SIZE} \
     --node_rank=${RANK} \
     train/train_v2.py \
-    --env_model_path /liujinxin/zhy/ICLR2026/logs/STAGE1_TRAINER_Balance_Loss_StateNorm/checkpoint-200 \
     --actor_model_path /liujinxin/zhy/ICLR2026/logs/STAGE2_TRAINER_STAGE1EMABalance_StateNorm_warmup/checkpoint-300 \
     ${STAGE_ARGS} \
     --deepspeed configs/deepspeed/zero3_offload.json \
@@ -56,7 +60,6 @@ torchrun \
     --max_position_embeddings 6400 \
     --eval_strategy no \
     --seed 42 \
-    --report_to "wandb" \
     --logging_steps 8 \
     --gradient_checkpointing True \
     --gradient_accumulation_steps  8 \
@@ -67,4 +70,6 @@ torchrun \
     --remove_unused_columns False \
     --dataloader_pin_memory True \
     --dataloader_drop_last True  \
-    --exp_name "STAGE2_TRAINER_STAGE1EMABalance_StateNorm_EnvActor"
+    --exp_name "STAGE2_TRAINER_STAGE1EMABalance_StateNorm_EnvActor" \
+    --report_to "none" 
+kill $SERVER_PID

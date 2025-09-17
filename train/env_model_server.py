@@ -34,33 +34,30 @@ class EnvModelServer:
             attn_implementation="eager",
             torch_dtype=torch.bfloat16
         )
-        
-        # 确保模型处于评估模式
+        for param in self.model.parameters():
+            param.requires_grad = False
         self.model.eval()
         
-        # 将模型移至GPU
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         
-        logging.info(f"环境模型已加载，使用设备: {self.device}")
-        
-    async def handle_client(self, websocket, path):
+    
+    # 修复方法签名，只接收一个参数
+    async def handle_client(self, websocket):
         try:
             async for message in websocket:
-                # 接收数据
                 data = json.loads(message)
                 
-                # 处理输入数据
                 text_ids_list = [torch.tensor(item) for item in data['text_ids_list']]
                 image_token_ids = torch.tensor(data['image_token_ids'])
                 states = torch.tensor(data['states'])
                 
-                # 移至正确设备
+
                 text_ids_list = [x.to(self.device) for x in text_ids_list]
                 image_token_ids = image_token_ids.to(self.device)
-                states = states.to(self.device, dtype=torch.float16 if torch.cuda.is_available() else torch.float32)
+                states = states.to(self.device, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+
                 
-                # 使用模型推理
                 with torch.no_grad():
                     reward_results = self.model.sample_rewards(
                         text_ids_list=text_ids_list,
@@ -68,26 +65,55 @@ class EnvModelServer:
                         states=states
                     )
                 
-                # 转换结果为可序列化格式
+                # 优化: 仅发送关键hidden_states片段，而不是整个隐藏状态矩阵
+                hidden_states = reward_results['hidden_states'] 
+                hidden_states_shape = hidden_states.shape 
+                context_lengths = reward_results['context_lengths'] 
+                best_reward_group = reward_results['best_reward_group'] 
+                reward_group_size = 5 
+                
+
+                critical_segments = []
+                for i in range(len(context_lengths)):
+                    context_len_i = context_lengths[i]
+                    best_idx = best_reward_group[i].item()
+                    group_start = context_len_i + best_idx * (reward_group_size + 1)  # +1 for rtg
+                    group_end = group_start + reward_group_size + 1  # +1 for rtg
+                    critical_segment = hidden_states[i:i+1, group_start:group_end, :].cpu().to(torch.float32)
+                    critical_segments.append(critical_segment.numpy().tolist())
+                
                 serialized_results = {
-                    'reward_preds_group_mean': reward_results['reward_preds_group_mean'].cpu().numpy().tolist(),
-                    'best_reward_group': reward_results['best_reward_group'].cpu().numpy().tolist(),
+                    'reward_preds_group_mean': reward_results['reward_preds_group_mean'].cpu().to(torch.float32).numpy().tolist(),
+                    'best_reward_group': best_reward_group.cpu().numpy().tolist(),
+                    'critical_segments': critical_segments,  # 只发送关键片段
+                    'hidden_states_shape': list(hidden_states_shape),  # 完整形状信息，用于客户端重建
+                    'context_lengths': context_lengths,
+                    'reward_group_size': reward_group_size,
                     'noise_norm': float(reward_results['noise_norm']),
                     'reward_embedding_norm': float(reward_results['reward_embedding_norm']),
                     'rwd_noise_ratio': float(reward_results['rwd_noise_ratio']),
                     'rtg_noise_ratio': float(reward_results['rtg_noise_ratio'])
                 }
                 
-                # 发送结果
                 await websocket.send(json.dumps(serialized_results))
                 
         except Exception as e:
             logging.error(f"处理客户端请求时出错: {e}")
     
     async def start_server(self):
-        async with websockets.serve(self.handle_client, self.host, self.port):
-            logging.info(f"环境模型服务已启动，监听于 {self.host}:{self.port}")
-            await asyncio.Future()  # 运行直到被取消
+        # 增大最大消息大小并设置更大的超时时间
+        server = await websockets.serve(
+            self.handle_client, 
+            self.host, 
+            self.port, 
+            max_size=1024*1024*500,  # 500MB
+            ping_interval=None,      # 禁用ping
+            max_queue=100,           # 增大队列
+            open_timeout=300,        # 5分钟握手超时
+            close_timeout=300        # 5分钟关闭超时
+        )
+        logging.info(f"环境模型服务已启动，监听于 {self.host}:{self.port}, 最大消息大小: 500MB, 超时: 300秒")
+        await server.wait_closed()
 
 # 运行服务器
 if __name__ == "__main__":
