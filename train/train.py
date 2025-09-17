@@ -239,6 +239,7 @@ def main():
     # 设置模型训练模式
     model.set_mode(parallel_mode=model_args.parallel_mode)
     print(f"Model mode set to: parallel_mode={model_args.parallel_mode}")
+    print(f"model embedding size: {model.get_input_embeddings().weight.shape[0]}")
 
     # Enable gradient checkpointing if specified
     if training_args.gradient_checkpointing:

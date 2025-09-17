@@ -1,5 +1,6 @@
 wandb/
 test/
+/liujinxin/zhy/ICLR2026/pretrain/Emu3-VisionTokenizer/
 logs/
 train/trush/
 eval/logs/

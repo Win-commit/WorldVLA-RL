@@ -6,12 +6,12 @@ MASTER_PORT=${MASTER_PORT:-23456}
 NGPUS=8
 
 export WANDB_BASE_URL="https://api.bandw.top"
-# API_KEY=bf924aa39303a0d8808787e3777696c3626d4850
-# wandb login $API_KEY
+API_KEY=bf924aa39303a0d8808787e3777696c3626d4850
+wandb login $API_KEY
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE=${1:-stage2}  
-EXP_NAME="STAGE2_TRAINER_STAGE1EMABalance_StateNorm_p0-1"
+EXP_NAME="STAGE2_TRAINER_STAGE1EMABalance_StateNorm_warmup"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -21,7 +21,7 @@ if [ "$STAGE" = "stage1" ]; then
     FRAMES=6
 else
     STAGE_ARGS="--stage stage2 --parallel_mode True --parallel_reward_groups 10 --reward_group_size 5 --gamma 0.9 --noise_factor 0.4 --p 0"
-    FRAMES=1
+    FRAMES=2
 fi
 
 torchrun \
@@ -43,11 +43,11 @@ torchrun \
     --bf16 True \
     --tf32 True \
     --data_path ${DATAPATH} \
-    --max_steps 15000 \
+    --max_steps 500 \
     --dataloader_num_workers 12 \
     --lr_scheduler_type "cosine_with_min_lr" \
     --warmup_steps 50 \
-    --per_device_train_batch_size 1 \
+    --per_device_train_batch_size 3 \
     --frames ${FRAMES} \
     --action_frames 10 \
     --attn_type "flash_attention_2" \
@@ -59,11 +59,12 @@ torchrun \
     --logging_steps 8 \
     --gradient_checkpointing True \
     --gradient_accumulation_steps  8 \
-    --save_steps 500 \
+    --save_steps 100 \
     --save_strategy "steps" \
     --evaluation_strategy "no" \
     --run_name "unified_${STAGE}_training_$(date +%Y%m%d_%H%M%S)" \
     --remove_unused_columns False \
     --dataloader_pin_memory True \
     --dataloader_drop_last True  \
-    --exp_name "STAGE2_TRAINER_STAGE1EMABalance_StateNorm_p0-1"
+    --exp_name "STAGE2_TRAINER_STAGE1EMABalance_StateNorm_warmup" \
+    --resume_from_checkpoint /liujinxin/zhy/ICLR2026/logs/STAGE2_TRAINER_STAGE1EMABalance_StateNorm_warmup/checkpoint-300
