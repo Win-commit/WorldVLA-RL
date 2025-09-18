@@ -6,8 +6,8 @@ MASTER_PORT=${MASTER_PORT:-23456}
 NGPUS=8
 
 export WANDB_BASE_URL="https://api.bandw.top"
-# API_KEY=bf924aa39303a0d8808787e3777696c3626d4850
-# wandb login $API_KEY
+API_KEY=bf924aa39303a0d8808787e3777696c3626d4850
+wandb login $API_KEY
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE=${1:-stage2}  
@@ -26,113 +26,32 @@ else
     FRAMES=1
 fi
 
-python train/env_model_server.py \
-    --model_path ${ENV_MODEL_PATH} \
-    --parallel_reward_groups 10 \
-    --reward_group_size 5 \
-    --gamma 0.9 \
-    --noise_factor 0.4 \
-    --p 1 \
-    --attn_implementation "eager" \
-    --gpu_id 0 \
-    --port 8000\  &
-SERVER_PID1=$!
-echo "Environment Model Server #1 Started, PID: $SERVER_PID1"
+SERVER_PORTS=()
+SERVER_PIDS=()
 
+for GPU_ID in {0..7}; do
+    PORT=$((8000 + GPU_ID))
+    SERVER_PORTS+=($PORT)
+    
+    echo "Starting environment model server #$((GPU_ID+1)) on GPU $GPU_ID, port $PORT"
+    python /liujinxin/zhy/ICLR2026/train/env_model_server.py \
+        --model_path $ENV_MODEL_PATH \
+        --port $PORT \
+        --parallel_reward_groups 10 \
+        --reward_group_size 5 \
+        --gamma 0.9 \
+        --noise_factor 0.4 \
+        --p 1.0 \
+        --attn_implementation eager \
+        --gpu_id $GPU_ID &
+    
+    SERVER_PID=$!
+    SERVER_PIDS+=($SERVER_PID)
+    echo "Environment model server #$((GPU_ID+1)) started, PID: $SERVER_PID"
+done
 
-python train/env_model_server.py \
-    --model_path ${ENV_MODEL_PATH} \
-    --parallel_reward_groups 10 \
-    --reward_group_size 5 \
-    --gamma 0.9 \
-    --noise_factor 0.4 \
-    --p 1 \
-    --attn_implementation "eager" \
-    --gpu_id 1 \
-    --port 8001\  &
-SERVER_PID2=$!
-echo "Environment Modeling Server #2 Started, PID: $SERVER_PID2"
-
-
-python train/env_model_server.py \
-    --model_path ${ENV_MODEL_PATH} \
-    --parallel_reward_groups 10 \
-    --reward_group_size 5 \
-    --gamma 0.9 \
-    --noise_factor 0.4 \
-    --p 1 \
-    --attn_implementation "eager" \
-    --gpu_id 2 \
-    --port 8002\  &
-SERVER_PID3=$!
-echo "Environment Modeling Server #3 Started, PID: $SERVER_PID3"
-
-python train/env_model_server.py \
-    --model_path ${ENV_MODEL_PATH} \
-    --parallel_reward_groups 10 \
-    --reward_group_size 5 \
-    --gamma 0.9 \
-    --noise_factor 0.4 \
-    --p 1 \
-    --attn_implementation "eager" \
-    --gpu_id 3 \
-    --port 8003\  &
-SERVER_PID4=$!
-echo "Environment Modeling Server #4 Started, PID: $SERVER_PID4"
-
-python train/env_model_server.py \
-    --model_path ${ENV_MODEL_PATH} \
-    --parallel_reward_groups 10 \
-    --reward_group_size 5 \
-    --gamma 0.9 \
-    --noise_factor 0.4 \
-    --p 1 \
-    --attn_implementation "eager" \
-    --gpu_id 4 \
-    --port 8004\  &
-SERVER_PID5=$!
-echo "Environment Modeling Server #4 Started, PID: $SERVER_PID5"
-
-python train/env_model_server.py \
-    --model_path ${ENV_MODEL_PATH} \
-    --parallel_reward_groups 10 \
-    --reward_group_size 5 \
-    --gamma 0.9 \
-    --noise_factor 0.4 \
-    --p 1 \
-    --attn_implementation "eager" \
-    --gpu_id 5 \
-    --port 8005\  &
-SERVER_PID6=$!
-echo "Environment Modeling Server #6 Started, PID: $SERVER_PID6"
-
-python train/env_model_server.py \
-    --model_path ${ENV_MODEL_PATH} \
-    --parallel_reward_groups 10 \
-    --reward_group_size 5 \
-    --gamma 0.9 \
-    --noise_factor 0.4 \
-    --p 1 \
-    --attn_implementation "eager" \
-    --gpu_id 6 \
-    --port 8006\  &
-SERVER_PID7=$!
-echo "Environment Modeling Server #7 Started, PID: $SERVER_PID7"
-
-python train/env_model_server.py \
-    --model_path ${ENV_MODEL_PATH} \
-    --parallel_reward_groups 10 \
-    --reward_group_size 5 \
-    --gamma 0.9 \
-    --noise_factor 0.4 \
-    --p 1 \
-    --attn_implementation "eager" \
-    --gpu_id 7 \
-    --port 8007\  &
-SERVER_PID8=$!
-echo "Environment Modeling Server #8 Started, PID: $SERVER_PID8"
-
-
+SERVER_LIST=$(IFS=,; echo "localhost:${SERVER_PORTS[*]}")
+echo "Server list: $SERVER_LIST"
 sleep 60
 
 torchrun \
@@ -142,7 +61,7 @@ torchrun \
     train/train_v2.py \
     --actor_model_path ${ACTOR_MODEL_PATH} \
     ${STAGE_ARGS} \
-    --env_servers "localhost:8000,localhost:8001,localhost:8002,localhost:8003,localhost:8004,localhost:8005,localhost:8006,localhost:8007" \
+    --env_servers $SERVER_LIST \
     --deepspeed configs/deepspeed/zero3_offload.json \
     --output_dir "logs/"${EXP_NAME} \
     --learning_rate 8e-5 \
@@ -180,11 +99,7 @@ torchrun \
     --exp_name "STAGE2_TRAINER_STAGE1EMABalance_StateNorm_EnvActor" \
     --report_to "wandb" 
 
-kill $SERVER_PID1
-kill $SERVER_PID2
-kill $SERVER_PID3
-kill $SERVER_PID4
-kill $SERVER_PID5
-kill $SERVER_PID6
-kill $SERVER_PID7
-kill $SERVER_PID8
+for PID in "${SERVER_PIDS[@]}"; do
+    echo "Killing server with PID: $PID"
+    kill -9 $PID
+done

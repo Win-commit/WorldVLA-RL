@@ -18,14 +18,22 @@ import deepspeed
 import json
 # import logging
 # logging.getLogger("transformers").setLevel(logging.DEBUG)
-import threading
-import queue
-import uuid
 import time
 import websockets
 import asyncio
 import numpy as np
-import pickle  # 添加pickle用于二进制序列化
+import pickle  
+import logging
+import random
+from datetime import datetime
+
+# 设置日志格式
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] [%(filename)s:%(lineno)d] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 os.environ["WANDB_BASE_URL"] = "https://api.bandw.top"
 
@@ -87,21 +95,96 @@ class EnvModelClient:
         if servers is None:
             servers = [("localhost", 8765)]
         
+        self.servers = servers
+        self.num_servers = len(servers)
+        self.server_status = {i: {"available": True, "last_failure": 0, "failure_count": 0} 
+                             for i in range(self.num_servers)}
+        
         # 根据rank选择要连接的服务器
-        server_idx = rank % len(servers)
+        self.rank = rank
+        server_idx = rank % self.num_servers
+        self.primary_server_idx = server_idx
         host, port = servers[server_idx]
         self.uri = f"ws://{host}:{port}"
         
         self.max_retries = max_retries
-        self.rank = rank
         self.retry_delay = 2.0  
         
-        print(f"Rank {rank} 分配到服务器 {host}:{port}, URI: {self.uri}, 重试延迟: {self.retry_delay}秒")
+        # 添加请求统计
+        self.total_requests = 0
+        self.successful_requests = 0
+        
+        logger.info(f"[Rank {rank}] Assigned to primary server {host}:{port} (idx: {server_idx}), "
+                   f"URI: {self.uri}, retry delay: {self.retry_delay}s")
+        logger.info(f"[Rank {rank}] Available servers: {', '.join([f'{s[0]}:{s[1]}' for s in self.servers])}")
+        
+    def _get_next_server(self):
+        """选择下一个可用服务器，优先选择最近失败时间最久的服务器"""
+        now = time.time()
+        # 排除当前主服务器
+        available_servers = [(idx, status) for idx, status in self.server_status.items() 
+                           if status["available"] and idx != self.primary_server_idx]
+        
+        if not available_servers:
+            # 如果没有其他可用服务器，按失败次数最少和失败时间最旧排序
+            all_servers = sorted(
+                [(idx, status) for idx, status in self.server_status.items() if idx != self.primary_server_idx],
+                key=lambda x: (x[1]["failure_count"], now - x[1]["last_failure"])
+            )
+            
+            if all_servers:
+                server_idx = all_servers[0][0]
+                # 如果失败时间小于30秒，则随机选择
+                if now - all_servers[0][1]["last_failure"] < 30:
+                    # 随机选择一个非主服务器
+                    candidates = [idx for idx in self.server_status.keys() if idx != self.primary_server_idx]
+                    if candidates:
+                        server_idx = random.choice(candidates)
+            else:
+                # 如果没有其他服务器，返回主服务器
+                server_idx = self.primary_server_idx
+        else:
+            # 按失败次数最少和失败时间最旧排序
+            sorted_servers = sorted(available_servers, 
+                                  key=lambda x: (x[1]["failure_count"], now - x[1]["last_failure"]))
+            server_idx = sorted_servers[0][0]
+            
+        host, port = self.servers[server_idx]
+        uri = f"ws://{host}:{port}"
+        return server_idx, uri
+    
+    def _mark_server_failure(self, server_idx):
+        """标记服务器连接失败"""
+        self.server_status[server_idx]["last_failure"] = time.time()
+        self.server_status[server_idx]["failure_count"] += 1
+        # 如果连续失败超过10次，标记为不可用
+        if self.server_status[server_idx]["failure_count"] > 10:
+            self.server_status[server_idx]["available"] = False
+            logger.warning(f"[Rank {self.rank}] Marking server {self.servers[server_idx][0]}:{self.servers[server_idx][1]} "
+                          f"as unavailable after {self.server_status[server_idx]['failure_count']} failures")
+    
+    def _mark_server_success(self, server_idx):
+        """标记服务器连接成功"""
+        self.server_status[server_idx]["failure_count"] = 0
+        self.server_status[server_idx]["available"] = True
         
     async def sample_rewards_async(self, text_ids_list, image_token_ids, states):
+        request_id = f"{self.rank}-{self.total_requests}"
+        self.total_requests += 1
         
-        for attempt in range(self.max_retries):
+        logger.info(f"[Rank {self.rank}] Request #{request_id} starting")
+        
+        # 先尝试主服务器
+        current_server_idx = self.primary_server_idx
+        current_uri = self.uri
+        
+        for attempt in range(self.max_retries * 2):  # 增加最大尝试次数，允许更多服务器切换
             try:
+                start_time = time.time()
+                
+                # 准备数据
+                logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
+                          f"Preparing data for server {current_uri}")
                 data = {
                     'text_ids_list': [ids.cpu().numpy() for ids in text_ids_list],
                     'image_token_ids': image_token_ids.cpu().numpy(),
@@ -111,33 +194,49 @@ class EnvModelClient:
                 # 使用pickle二进制序列化
                 binary_data = pickle.dumps(data)
                 
+                logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
+                          f"Connecting to {current_uri}")
+                
                 # 连接服务器时添加兼容性设置和超时参数
                 async with websockets.connect(
-                    self.uri,
+                    current_uri,
                     max_size=1024*1024*500,  # 500MB
                     open_timeout=300,        # 5分钟超时
                     close_timeout=300,       # 5分钟超时
                     ping_interval=None,      # 禁用ping
                     compression=None         # 不使用压缩
                 ) as websocket:
+                    logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
+                              f"Connected to {current_uri}, sending data ({len(binary_data)/(1024*1024):.2f}MB)")
+                    
                     # 发送二进制数据
                     await websocket.send(binary_data)
                     
                     # 接收二进制结果
+                    logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
+                              f"Waiting for response from {current_uri}")
                     binary_response = await websocket.recv()
+                    
                     # 使用字节类型进行反序列化，确保兼容性
                     if isinstance(binary_response, str):
                         # 如果返回的是字符串，可能是旧版服务器返回的JSON
                         results = json.loads(binary_response)
+                        logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
+                                  f"Received JSON response from {current_uri}")
                     else:
                         # 否则作为二进制数据处理
                         results = pickle.loads(binary_response)
+                        logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
+                                  f"Received binary response from {current_uri} "
+                                  f"({len(binary_response)/(1024*1024):.2f}MB)")
                     
                     # 转换回PyTorch张量，并确保使用正确的数据类型
                     device = image_token_ids.device
                     dtype = torch.bfloat16
                     
                     # 仅从关键片段重构必要的hidden_states
+                    logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
+                              f"Reconstructing hidden states")
                     hidden_states_shape = results['hidden_states_shape']
                     context_lengths = results['context_lengths']
                     best_reward_group = results['best_reward_group']
@@ -167,18 +266,54 @@ class EnvModelClient:
                         'rtg_noise_ratio': results['rtg_noise_ratio']
                     }
                     
+                    end_time = time.time()
+                    self.successful_requests += 1
+                    
+                    # 标记服务器成功
+                    self._mark_server_success(current_server_idx)
+                    
+                    # 如果当前使用的不是主服务器，且主服务器已标记为不可用，尝试恢复主服务器状态
+                    if current_server_idx != self.primary_server_idx and not self.server_status[self.primary_server_idx]["available"]:
+                        if time.time() - self.server_status[self.primary_server_idx]["last_failure"] > 300:  # 5分钟恢复检查
+                            self.server_status[self.primary_server_idx]["available"] = True
+                            self.server_status[self.primary_server_idx]["failure_count"] = 0
+                            logger.info(f"[Rank {self.rank}] Re-enabling primary server "
+                                      f"{self.servers[self.primary_server_idx][0]}:{self.servers[self.primary_server_idx][1]} "
+                                      f"after cooldown period")
+                    
+                    logger.info(f"[Rank {self.rank}] Request #{request_id} completed successfully in {end_time-start_time:.2f}s "
+                              f"using server {current_uri} ({self.successful_requests}/{self.total_requests} successful)")
+                    
                     return reward_results
                     
             except Exception as e:
-                delay = self.retry_delay * (2 ** attempt)  # 指数退避策略
-                print(f"Rank {self.rank} WebSocket错误 (尝试 {attempt+1}/{self.max_retries}, 将在{delay}秒后重试): {str(e)[:200]}...")
+                # 标记当前服务器失败
+                self._mark_server_failure(current_server_idx)
                 
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(delay + 0.1 * self.rank)  # 添加rank相关的延迟避免同步重试
+                # 计算指数退避延迟
+                delay = self.retry_delay * (1.5 ** (attempt % 3))  # 每3次尝试重置指数退避
+                
+                # 打印错误信息
+                logger.error(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1} failed: "
+                           f"Error connecting to {current_uri}: {str(e)[:200]}...")
+                
+                # 是否还有重试次数
+                if attempt < self.max_retries * 2 - 1:
+                    # 选择另一个服务器进行尝试
+                    current_server_idx, current_uri = self._get_next_server()
+                    
+                    logger.info(f"[Rank {self.rank}] Request #{request_id}: "
+                              f"Switching to server {current_uri} (idx: {current_server_idx}), "
+                              f"will retry in {delay:.2f}s")
+                    
+                    # 添加延迟，避免所有rank同时切换并重试
+                    jitter = 0.1 * random.random() * (1 + self.rank)
+                    await asyncio.sleep(delay + jitter)
                 else:
                     # 如果多次尝试失败，直接抛出异常
-                    print(f"Rank {self.rank} 连接失败，已尝试 {self.max_retries} 次，终止训练")
-                    raise
+                    logger.critical(f"[Rank {self.rank}] Request #{request_id}: Connection failed after "
+                                  f"{attempt+1} attempts across multiple servers. Terminating training.")
+                    raise RuntimeError(f"Failed to connect to any environment model server after {attempt+1} attempts")
     
     def sample_rewards(self, text_ids_list, image_token_ids, states):
         # 创建新的事件循环避免冲突
@@ -368,16 +503,12 @@ def main():
 
     # 解析环境模型服务器配置
     servers = []
-    for server_config in model_args.env_servers.split(","):
-        if ":" in server_config:
-            host, port_str = server_config.strip().split(":")
-            port = int(port_str)
-            servers.append((host, port))
-        else:
-            # 如果没有指定端口，使用默认端口
-            servers.append((server_config.strip(), 8765))
+    ip = model_args.env_servers.split(":")[0]
+    ports = model_args.env_servers.split(":")[1].split(",")
+    for port in ports:
+        servers.append((ip, int(port)))
     
-    print(f"使用环境模型服务器列表: {servers}")
+    print(f"Environment Server List: {servers}")
 
     # 创建环境模型客户端而不是直接加载模型
     rank = getattr(training_args, 'local_rank', 0)

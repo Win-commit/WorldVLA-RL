@@ -11,7 +11,13 @@ import asyncio
 import logging
 import pickle  # 添加pickle模块用于二进制序列化
 
-logging.basicConfig(level=logging.INFO)
+# 设置更详细的日志格式
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] [%(filename)s:%(lineno)d] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 class EnvModelServer:
     def __init__(self, model_path, host="0.0.0.0", port=8765, 
@@ -23,10 +29,14 @@ class EnvModelServer:
         
         # 使用指定的GPU设备
         self.device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
+        logger.info(f"[Server {port}] Using GPU device: {self.device}")
         
         # 加载环境模型
+        logger.info(f"[Server {port}] Loading tokenizer from {model_path}")
         self.tokenizer = Emu3Tokenizer.from_pretrained(model_path, trust_remote_code=True)
         config = Emu3RewardConfig.from_pretrained(model_path)
+        
+        logger.info(f"[Server {port}] Loading model from {model_path}")
         self.model = Emu3UnifiedRewardModel.from_pretrained(
             model_path,
             config=config,
@@ -51,26 +61,44 @@ class EnvModelServer:
         # 保存reward_group_size以便后续使用
         self.reward_group_size = reward_group_size
         
-        logging.info(f"环境模型已加载到 {self.device}，配置参数: parallel_reward_groups={parallel_reward_groups}, "
-                    f"reward_group_size={reward_group_size}, gamma={gamma}, noise_factor={noise_factor}, p={p}")
+        logger.info(f"[Server {port}] Environment model loaded on {self.device}, "
+                   f"config: parallel_reward_groups={parallel_reward_groups}, "
+                   f"reward_group_size={reward_group_size}, gamma={gamma}, "
+                   f"noise_factor={noise_factor}, p={p}")
+        
+        # 添加计数器跟踪请求
+        self.request_count = 0
+        self.successful_requests = 0
     
     # 修复方法签名，只接收一个参数
     async def handle_client(self, websocket):
+        client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+        request_id = self.request_count
+        self.request_count += 1
+        
         try:
+            logger.info(f"[Server {self.port}] New connection from {client_id} (request #{request_id})")
             async for message in websocket:
+                start_time = time.time()
+                logger.info(f"[Server {self.port}] Processing request #{request_id} from {client_id}")
+                
                 # 接收二进制数据并反序列化
                 data = pickle.loads(message)
+                logger.info(f"[Server {self.port}] Request #{request_id}: Data received and deserialized, "
+                           f"batch_size={len(data['text_ids_list'])}")
                 
                 text_ids_list = [torch.from_numpy(item) for item in data['text_ids_list']]
                 image_token_ids = torch.from_numpy(data['image_token_ids'])
                 states = torch.from_numpy(data['states'])
                 
-
+                # 移动数据到设备
+                logger.info(f"[Server {self.port}] Request #{request_id}: Moving tensors to device {self.device}")
                 text_ids_list = [x.to(self.device) for x in text_ids_list]
                 image_token_ids = image_token_ids.to(self.device)
                 states = states.to(self.device, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
 
-                
+                # 模型推理
+                logger.info(f"[Server {self.port}] Request #{request_id}: Running model inference")
                 with torch.no_grad():
                     reward_results = self.model.sample_rewards(
                         text_ids_list=text_ids_list,
@@ -79,13 +107,13 @@ class EnvModelServer:
                     )
                 
                 # 优化: 仅发送关键hidden_states片段，而不是整个隐藏状态矩阵
+                logger.info(f"[Server {self.port}] Request #{request_id}: Processing hidden states")
                 hidden_states = reward_results['hidden_states'] 
                 hidden_states_shape = hidden_states.shape 
                 context_lengths = reward_results['context_lengths'] 
                 best_reward_group = reward_results['best_reward_group'] 
                 reward_group_size = self.reward_group_size 
                 
-
                 # 直接使用numpy数组而非列表，减少转换开销
                 critical_segments = []
                 for i in range(len(context_lengths)):
@@ -97,6 +125,7 @@ class EnvModelServer:
                     critical_segments.append(critical_segment)
                 
                 # 准备要发送的二进制数据
+                logger.info(f"[Server {self.port}] Request #{request_id}: Preparing response data")
                 serialized_results = {
                     'reward_preds_group_mean': reward_results['reward_preds_group_mean'].cpu().to(torch.float32).numpy(),
                     'best_reward_group': best_reward_group.cpu().numpy(),
@@ -112,15 +141,24 @@ class EnvModelServer:
                 
                 # 序列化为二进制数据
                 binary_data = pickle.dumps(serialized_results)
+                logger.info(f"[Server {self.port}] Request #{request_id}: Serialized response, size={len(binary_data)/(1024*1024):.2f}MB")
                 
                 # 发送二进制数据
                 await websocket.send(binary_data)
                 
+                end_time = time.time()
+                self.successful_requests += 1
+                logger.info(f"[Server {self.port}] Request #{request_id} completed in {end_time-start_time:.2f}s "
+                           f"({self.successful_requests}/{self.request_count} successful)")
+                
         except Exception as e:
-            logging.error(f"处理客户端请求时出错: {e}")
+            logger.error(f"[Server {self.port}] Error handling client {client_id}, request #{request_id}: {e}")
+            import traceback
+            logger.error(f"[Server {self.port}] Traceback: {traceback.format_exc()}")
     
     async def start_server(self):
         # 增大最大消息大小并设置更大的超时时间
+        logger.info(f"[Server {self.port}] Starting server on {self.host}:{self.port}")
         server = await websockets.serve(
             self.handle_client, 
             self.host, 
@@ -131,12 +169,14 @@ class EnvModelServer:
             open_timeout=300,        # 5分钟握手超时
             close_timeout=300        # 5分钟关闭超时
         )
-        logging.info(f"环境模型服务已启动，监听于 {self.host}:{self.port}, 最大消息大小: 500MB, 超时: 300秒")
+        logger.info(f"[Server {self.port}] Server started successfully, listening on {self.host}:{self.port}, "
+                   f"max_size: 500MB, timeout: 300s, max_queue: 100")
         await server.wait_closed()
 
 # 运行服务器
 if __name__ == "__main__":
     import argparse
+    import time
     
     parser = argparse.ArgumentParser(description="环境模型服务器")
     parser.add_argument("--model_path", type=str, 
@@ -155,6 +195,8 @@ if __name__ == "__main__":
     parser.add_argument("--gpu_id", type=int, default=0, help="使用的GPU ID")
     
     args = parser.parse_args()
+    
+    logger.info(f"Starting environment model server on port {args.port} using GPU {args.gpu_id}")
     
     server = EnvModelServer(
         model_path=args.model_path, 
