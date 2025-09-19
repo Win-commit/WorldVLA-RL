@@ -78,7 +78,7 @@ torchrun \
     --dataloader_num_workers 12 \
     --lr_scheduler_type "cosine_with_min_lr" \
     --warmup_steps 50 \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size 1 \
     --frames ${FRAMES} \
     --action_frames 10 \
     --attn_type "flash_attention_2" \
@@ -88,7 +88,7 @@ torchrun \
     --seed 42 \
     --logging_steps 8 \
     --gradient_checkpointing True \
-    --gradient_accumulation_steps  8 \
+    --gradient_accumulation_steps  10 \
     --save_steps 500 \
     --save_strategy "steps" \
     --evaluation_strategy "no" \

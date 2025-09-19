@@ -51,7 +51,7 @@ class ModelArguments:
     noise_factor: float = field(default=0.1, metadata={"help": "噪声因子(stage2专用)"})
     # 添加环境模型服务器配置
     env_servers: str = field(default="localhost:8765", 
-                         metadata={"help": "环境模型服务器列表，格式为'host1:port1,host2:port2,...'"})
+                         metadata={"help": "环境模型服务器列表，格式为'host:port1,port2,...'"})
 
 
 @dataclass
@@ -83,249 +83,184 @@ class TrainingArguments(HFTrainingArguments):
 
 class EnvModelClient:
     def __init__(self, servers=None, rank=0, max_retries=5):
-        """
-        初始化环境模型客户端
-        
-        参数:
-            servers: 服务器列表，每个元素为(host, port)元组，例如[("localhost", 8765), ("localhost", 8766)]
-                     如果为None，则默认使用[("localhost", 8765)]
-            rank: 当前进程的rank
-            max_retries: 最大重试次数
-        """
-        if servers is None:
-            servers = [("localhost", 8765)]
-        
-        self.servers = servers
-        self.num_servers = len(servers)
-        self.server_status = {i: {"available": True, "last_failure": 0, "failure_count": 0} 
-                             for i in range(self.num_servers)}
-        
-        # 根据rank选择要连接的服务器
+        self.servers = servers or [("localhost", 8765)]
         self.rank = rank
-        server_idx = rank % self.num_servers
-        self.primary_server_idx = server_idx
-        host, port = servers[server_idx]
-        self.uri = f"ws://{host}:{port}"
-        
+        self.primary_server_idx = rank % len(self.servers)
         self.max_retries = max_retries
-        self.retry_delay = 2.0  
         
-        # 添加请求统计
+        # 请求计数
         self.total_requests = 0
         self.successful_requests = 0
         
-        logger.info(f"[Rank {rank}] Assigned to primary server {host}:{port} (idx: {server_idx}), "
-                   f"URI: {self.uri}, retry delay: {self.retry_delay}s")
-        logger.info(f"[Rank {rank}] Available servers: {', '.join([f'{s[0]}:{s[1]}' for s in self.servers])}")
+        self.loop = asyncio.new_event_loop()
         
-    def _get_next_server(self):
-        """选择下一个可用服务器，优先选择最近失败时间最久的服务器"""
-        now = time.time()
-        # 排除当前主服务器
-        available_servers = [(idx, status) for idx, status in self.server_status.items() 
-                           if status["available"] and idx != self.primary_server_idx]
+        self.connection = None
+        self.server_idx = self.primary_server_idx
         
-        if not available_servers:
-            # 如果没有其他可用服务器，按失败次数最少和失败时间最旧排序
-            all_servers = sorted(
-                [(idx, status) for idx, status in self.server_status.items() if idx != self.primary_server_idx],
-                key=lambda x: (x[1]["failure_count"], now - x[1]["last_failure"])
-            )
-            
-            if all_servers:
-                server_idx = all_servers[0][0]
-                # 如果失败时间小于30秒，则随机选择
-                if now - all_servers[0][1]["last_failure"] < 30:
-                    # 随机选择一个非主服务器
-                    candidates = [idx for idx in self.server_status.keys() if idx != self.primary_server_idx]
-                    if candidates:
-                        server_idx = random.choice(candidates)
-            else:
-                # 如果没有其他服务器，返回主服务器
-                server_idx = self.primary_server_idx
-        else:
-            # 按失败次数最少和失败时间最旧排序
-            sorted_servers = sorted(available_servers, 
-                                  key=lambda x: (x[1]["failure_count"], now - x[1]["last_failure"]))
-            server_idx = sorted_servers[0][0]
-            
-        host, port = self.servers[server_idx]
-        uri = f"ws://{host}:{port}"
-        return server_idx, uri
+        # 服务器状态追踪
+        self.server_status = {i: {"available": True, "last_failure": 0, "failure_count": 0} 
+                             for i in range(len(self.servers))}
+        
+        self.connection = self.loop.run_until_complete(self._initialize_connection())
+        
+        host, port = self.servers[self.server_idx]
+        logger.info(f"[Rank {self.rank}] 初始化客户端，已连接到 {host}:{port}")
     
-    def _mark_server_failure(self, server_idx):
-        """标记服务器连接失败"""
-        self.server_status[server_idx]["last_failure"] = time.time()
-        self.server_status[server_idx]["failure_count"] += 1
-        # 如果连续失败超过10次，标记为不可用
-        if self.server_status[server_idx]["failure_count"] > 10:
-            self.server_status[server_idx]["available"] = False
-            logger.warning(f"[Rank {self.rank}] Marking server {self.servers[server_idx][0]}:{self.servers[server_idx][1]} "
-                          f"as unavailable after {self.server_status[server_idx]['failure_count']} failures")
-    
-    def _mark_server_success(self, server_idx):
-        """标记服务器连接成功"""
-        self.server_status[server_idx]["failure_count"] = 0
-        self.server_status[server_idx]["available"] = True
+    async def _initialize_connection(self):
+        """初始化WebSocket连接"""
+        for attempt in range(self.max_retries):
+            server_idx = self.server_idx
+            host, port = self.servers[server_idx]
+            uri = f"ws://{host}:{port}"
+            
+            try:
+                # logger.info(f"[Rank {self.rank}] 连接到 {uri}...")
+                # 建立连接
+                connection = await websockets.connect(
+                    uri,
+                    max_size=1024*1024*500,
+                    compression=None,
+                    close_timeout=300
+                )
+                logger.info(f"[Rank {self.rank}] 成功连接到 {uri}")
+                return connection
+            except Exception as e:
+                logger.error(f"[Rank {self.rank}] 连接失败: {str(e)}")
+                self.server_idx = (self.server_idx + 1) % len(self.servers)
+                await asyncio.sleep(1)
         
+        raise RuntimeError(f"无法连接到任何服务器")
+    
+    async def _ensure_connection(self):
+        """确保连接可用，如果不可用则重新连接"""
+        if self.connection is None:
+            logger.info(f"[Rank {self.rank}] 连接不可用，重新建立...")
+            self.connection = await self._initialize_connection()
+    
     async def sample_rewards_async(self, text_ids_list, image_token_ids, states):
+        """异步获取奖励采样结果"""
         request_id = f"{self.rank}-{self.total_requests}"
         self.total_requests += 1
         
-        logger.info(f"[Rank {self.rank}] Request #{request_id} starting")
+        # 准备数据
+        data = {
+            'text_ids_list': [ids.cpu().numpy() for ids in text_ids_list],
+            'image_token_ids': image_token_ids.cpu().numpy(),
+            'states': states.cpu().to(torch.float32).numpy()
+        }
+        binary_data = pickle.dumps(data)
         
-        # 先尝试主服务器
-        current_server_idx = self.primary_server_idx
-        current_uri = self.uri
-        
-        for attempt in range(self.max_retries * 2):  # 增加最大尝试次数，允许更多服务器切换
+        for attempt in range(self.max_retries):
+            start_time = time.time()
             try:
-                start_time = time.time()
+                await self._ensure_connection()
+                host, port = self.servers[self.server_idx]
+                uri = f"ws://{host}:{port}"
                 
-                # 准备数据
-                logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
-                          f"Preparing data for server {current_uri}")
-                data = {
-                    'text_ids_list': [ids.cpu().numpy() for ids in text_ids_list],
-                    'image_token_ids': image_token_ids.cpu().numpy(),
-                    'states': states.cpu().to(torch.float32).numpy()
+                # 发送请求
+                # logger.info(f"[Rank {self.rank}] 请求 #{request_id} 尝试 {attempt+1}: 发送数据到 {uri}")
+                await self.connection.send(binary_data)
+                
+                binary_response = await self.connection.recv()
+                
+                if isinstance(binary_response, str):
+                    results = json.loads(binary_response)
+                    # logger.info(f"[Rank {self.rank}] 请求 #{request_id}: 收到JSON响应")
+                else:
+                    results = pickle.loads(binary_response)
+                    # logger.info(f"[Rank {self.rank}] 请求 #{request_id}: 收到二进制响应 ({len(binary_response)/(1024*1024):.2f}MB)")
+                
+                device = image_token_ids.device
+                dtype = torch.bfloat16
+                
+                hidden_states_shape = results['hidden_states_shape']
+                context_lengths = results['context_lengths']
+                best_reward_group = results['best_reward_group']
+                critical_segments = results['critical_segments']
+                reward_group_size = results['reward_group_size']
+                
+
+                hidden_states = torch.zeros(hidden_states_shape, dtype=torch.float32)
+                
+                for i in range(len(context_lengths)):
+                    context_len_i = context_lengths[i]
+                    best_idx = best_reward_group[i]
+                    group_start = context_len_i + best_idx * (reward_group_size + 1)
+                    group_end = group_start + reward_group_size + 1
+                    
+                    critical_segment = torch.from_numpy(critical_segments[i])
+                    hidden_states[i:i+1, group_start:group_end, :] = critical_segment
+                
+                hidden_states = hidden_states.to(device=device, dtype=dtype)
+                
+                # 构建完整结果
+                reward_results = {
+                    'reward_preds_group_mean': torch.from_numpy(results['reward_preds_group_mean']).to(device=device, dtype=dtype),
+                    'best_reward_group': torch.from_numpy(results['best_reward_group']).to(device=device, dtype=torch.long),
+                    'hidden_states': hidden_states,
+                    'context_lengths': results['context_lengths'],
+                    'noise_norm': results['noise_norm'],
+                    'reward_embedding_norm': results['reward_embedding_norm'],
+                    'rwd_noise_ratio': results['rwd_noise_ratio'],
+                    'rtg_noise_ratio': results['rtg_noise_ratio']
                 }
                 
-                # 使用pickle二进制序列化
-                binary_data = pickle.dumps(data)
+                end_time = time.time()
+                self.successful_requests += 1
                 
-                logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
-                          f"Connecting to {current_uri}")
+                # logger.info(f"[Rank {self.rank}] 请求 #{request_id} 成功完成，用时 {end_time-start_time:.2f}s，"
+                #           f"使用服务器 {uri} ({self.successful_requests}/{self.total_requests} 成功)")
                 
-                # 连接服务器时添加兼容性设置和超时参数
-                async with websockets.connect(
-                    current_uri,
-                    max_size=1024*1024*500,  # 500MB
-                    open_timeout=300,        # 5分钟超时
-                    close_timeout=300,       # 5分钟超时
-                    ping_interval=None,      # 禁用ping
-                    compression=None         # 不使用压缩
-                ) as websocket:
-                    logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
-                              f"Connected to {current_uri}, sending data ({len(binary_data)/(1024*1024):.2f}MB)")
-                    
-                    # 发送二进制数据
-                    await websocket.send(binary_data)
-                    
-                    # 接收二进制结果
-                    logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
-                              f"Waiting for response from {current_uri}")
-                    binary_response = await websocket.recv()
-                    
-                    # 使用字节类型进行反序列化，确保兼容性
-                    if isinstance(binary_response, str):
-                        # 如果返回的是字符串，可能是旧版服务器返回的JSON
-                        results = json.loads(binary_response)
-                        logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
-                                  f"Received JSON response from {current_uri}")
-                    else:
-                        # 否则作为二进制数据处理
-                        results = pickle.loads(binary_response)
-                        logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
-                                  f"Received binary response from {current_uri} "
-                                  f"({len(binary_response)/(1024*1024):.2f}MB)")
-                    
-                    # 转换回PyTorch张量，并确保使用正确的数据类型
-                    device = image_token_ids.device
-                    dtype = torch.bfloat16
-                    
-                    # 仅从关键片段重构必要的hidden_states
-                    logger.info(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1}: "
-                              f"Reconstructing hidden states")
-                    hidden_states_shape = results['hidden_states_shape']
-                    context_lengths = results['context_lengths']
-                    best_reward_group = results['best_reward_group']
-                    critical_segments = results['critical_segments']
-                    reward_group_size = results['reward_group_size']
-                    
-                    hidden_states = torch.zeros(hidden_states_shape, dtype=dtype, device=device)
-                    
-                    for i in range(len(context_lengths)):
-                        context_len_i = context_lengths[i]
-                        best_idx = best_reward_group[i]
-                        group_start = context_len_i + best_idx * (reward_group_size + 1)  # +1 for rtg
-                        group_end = group_start + reward_group_size + 1  # +1 for rtg
-                        
-                        critical_segment = torch.from_numpy(critical_segments[i]).to(device=device, dtype=dtype)
-                        hidden_states[i:i+1, group_start:group_end, :] = critical_segment
-                    
-                    # 构建完整的reward_results，包含所有必要的数据
-                    reward_results = {
-                        'reward_preds_group_mean': torch.from_numpy(results['reward_preds_group_mean']).to(device=device, dtype=dtype),
-                        'best_reward_group': torch.from_numpy(results['best_reward_group']).to(device=device, dtype=torch.long),
-                        'hidden_states': hidden_states,  # 添加恢复的hidden_states
-                        'context_lengths': results['context_lengths'],  # 添加context_lengths
-                        'noise_norm': results['noise_norm'],
-                        'reward_embedding_norm': results['reward_embedding_norm'],
-                        'rwd_noise_ratio': results['rwd_noise_ratio'],
-                        'rtg_noise_ratio': results['rtg_noise_ratio']
-                    }
-                    
-                    end_time = time.time()
-                    self.successful_requests += 1
-                    
-                    # 标记服务器成功
-                    self._mark_server_success(current_server_idx)
-                    
-                    # 如果当前使用的不是主服务器，且主服务器已标记为不可用，尝试恢复主服务器状态
-                    if current_server_idx != self.primary_server_idx and not self.server_status[self.primary_server_idx]["available"]:
-                        if time.time() - self.server_status[self.primary_server_idx]["last_failure"] > 300:  # 5分钟恢复检查
-                            self.server_status[self.primary_server_idx]["available"] = True
-                            self.server_status[self.primary_server_idx]["failure_count"] = 0
-                            logger.info(f"[Rank {self.rank}] Re-enabling primary server "
-                                      f"{self.servers[self.primary_server_idx][0]}:{self.servers[self.primary_server_idx][1]} "
-                                      f"after cooldown period")
-                    
-                    logger.info(f"[Rank {self.rank}] Request #{request_id} completed successfully in {end_time-start_time:.2f}s "
-                              f"using server {current_uri} ({self.successful_requests}/{self.total_requests} successful)")
-                    
-                    return reward_results
-                    
+                return reward_results
+                
             except Exception as e:
-                # 标记当前服务器失败
-                self._mark_server_failure(current_server_idx)
+                logger.error(f"[Rank {self.rank}] 请求 #{request_id} 失败: {type(e).__name__}: {str(e)[:200]}...")
                 
-                # 计算指数退避延迟
-                delay = self.retry_delay * (1.5 ** (attempt % 3))  # 每3次尝试重置指数退避
+                # 关闭失败的连接
+                if self.connection:
+                    try:
+                        await self.connection.close()
+                    except:
+                        pass
+                self.connection = None
                 
-                # 打印错误信息
-                logger.error(f"[Rank {self.rank}] Request #{request_id} attempt {attempt+1} failed: "
-                           f"Error connecting to {current_uri}: {str(e)[:200]}...")
+                # 标记服务器失败并切换
+                self.server_status[self.server_idx]["last_failure"] = time.time()
+                self.server_status[self.server_idx]["failure_count"] += 1
                 
-                # 是否还有重试次数
-                if attempt < self.max_retries * 2 - 1:
-                    # 选择另一个服务器进行尝试
-                    current_server_idx, current_uri = self._get_next_server()
+                # 切换服务器并重试
+                if attempt < self.max_retries - 1:
+                    old_server_idx = self.server_idx
+                    self.server_idx = (self.server_idx + 1) % len(self.servers)
+                    old_host, old_port = self.servers[old_server_idx]
+                    new_host, new_port = self.servers[self.server_idx]
                     
-                    logger.info(f"[Rank {self.rank}] Request #{request_id}: "
-                              f"Switching to server {current_uri} (idx: {current_server_idx}), "
-                              f"will retry in {delay:.2f}s")
+                    logger.info(f"[Rank {self.rank}] 切换服务器从 {old_host}:{old_port} 到 {new_host}:{new_port}，"
+                              f"将在 {(attempt+1)}s 后重试")
                     
-                    # 添加延迟，避免所有rank同时切换并重试
-                    jitter = 0.1 * random.random() * (1 + self.rank)
-                    await asyncio.sleep(delay + jitter)
+                    # 添加重试延迟
+                    await asyncio.sleep((attempt+1) + random.random())
                 else:
-                    # 如果多次尝试失败，直接抛出异常
-                    logger.critical(f"[Rank {self.rank}] Request #{request_id}: Connection failed after "
-                                  f"{attempt+1} attempts across multiple servers. Terminating training.")
-                    raise RuntimeError(f"Failed to connect to any environment model server after {attempt+1} attempts")
+                    logger.critical(f"[Rank {self.rank}] 请求 #{request_id} 在 {self.max_retries} 次尝试后失败")
+                    raise RuntimeError(f"采样奖励失败，已尝试 {self.max_retries} 次")
     
     def sample_rewards(self, text_ids_list, image_token_ids, states):
-        # 创建新的事件循环避免冲突
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                self.sample_rewards_async(text_ids_list, image_token_ids, states)
-            )
-            return result
-        finally:
-            loop.close()
+        return self.loop.run_until_complete(
+            self.sample_rewards_async(text_ids_list, image_token_ids, states)
+        )
+    
+    def __del__(self):
+        """析构函数 - 关闭事件循环"""
+        if hasattr(self, 'loop') and self.loop and not self.loop.is_closed():
+            # 关闭所有连接
+            if hasattr(self, 'connection') and self.connection and not self.connection.closed:
+                try:
+                    self.loop.run_until_complete(self.connection.close())
+                except:
+                    pass
+            
+            # 关闭事件循环
+            self.loop.close()
 
 class Stage2DualModelTrainer(Trainer):
 
@@ -376,14 +311,11 @@ class Stage2DualModelTrainer(Trainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        # Unpack inputs
         text_ids_list, image_token_ids, states, reward_targets, rtg_targets, action_token_ids = inputs
         
-        # 确保模型在正确的设备上
         device = model.device
         dtype = torch.bfloat16 if self.args.bf16 else torch.float32
         
-        # 将输入数据转移到正确的设备
         text_ids_list = [x.to(device, non_blocking=True) for x in text_ids_list]
         image_token_ids = image_token_ids.to(device, non_blocking=True)
         states = states.to(device, dtype=dtype, non_blocking=True)
@@ -393,23 +325,18 @@ class Stage2DualModelTrainer(Trainer):
         if rtg_targets is not None:
             rtg_targets = rtg_targets.to(device, dtype=dtype, non_blocking=True)
             
-        # 使用客户端调用环境模型服务
         reward_sampling_results = self.env_model_client.sample_rewards(
             text_ids_list=text_ids_list,
             image_token_ids=image_token_ids,
             states=states
         )
         
-        # 2. 使用动作生成模型(actor_model)生成动作
         if len(action_token_ids) > 0:
-            # 检查并正确处理action_token_ids
             if isinstance(action_token_ids[0], list):
-                # 如果是嵌套列表，每个内部元素转换为tensor
                 action_token_ids = [[tensor.to(device, non_blocking=True) if isinstance(tensor, torch.Tensor) else 
                                     torch.tensor(tensor, device=device) for tensor in action_group] 
                                     for action_group in action_token_ids]
             else:
-                # 直接将列表中的每个张量移动到设备
                 action_token_ids = [x.to(device, non_blocking=True) if isinstance(x, torch.Tensor) else
                                     torch.tensor(x, device=device) for x in action_token_ids]
             outputs = self.actor_model.generate_actions(
@@ -428,7 +355,6 @@ class Stage2DualModelTrainer(Trainer):
                     "action_ce_loss": outputs["action_ce_loss"].item(),
                 }
                 
-                # 记录噪声与奖励嵌入的比例关系
                 if "noise_norm" in reward_sampling_results:
                     log_data.update({
                         "reward_embedding_norm": reward_sampling_results["reward_embedding_norm"],
@@ -448,14 +374,12 @@ class WandbLoggingCallback(TrainerCallback):
     """Custom callback for wandb logging"""
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
         if logs is not None and state.is_world_process_zero:
-            # Log to wandb
             log_data = {
                 "train/loss": logs.get("loss", 0),
                 "train/learning_rate": logs.get("learning_rate", 0),
                 "train/global_step": state.global_step,
             }
             
-            # 添加额外指标
             for key in ["action_ce_loss", "reward_embedding_norm", "noise_norm", 
                        "rwd_noise_ratio", "rtg_noise_ratio"]:
                 if key in logs:
@@ -501,7 +425,6 @@ def main():
         trust_remote_code=True,
     )
 
-    # 解析环境模型服务器配置
     servers = []
     ip = model_args.env_servers.split(":")[0]
     ports = model_args.env_servers.split(":")[1].split(",")
@@ -510,11 +433,7 @@ def main():
     
     print(f"Environment Server List: {servers}")
 
-    # 创建环境模型客户端而不是直接加载模型
-    rank = getattr(training_args, 'local_rank', 0)
-    env_model_client = EnvModelClient(servers=servers, rank=rank)
     
-    # 加载动作生成模型 (要训练的模型)
     actor_model_path = model_args.actor_model_path
     actor_config = Emu3RewardConfig.from_pretrained(actor_model_path)
     actor_model = Emu3UnifiedRewardModel.from_pretrained(
@@ -533,8 +452,10 @@ def main():
         torch_dtype=torch.bfloat16 if training_args.bf16 else None,
     )
 
+    rank = getattr(training_args, 'local_rank', 0)
+    env_model_client = EnvModelClient(servers=servers, rank=rank)
     
-    # print(f"Actor model embedding size: {actor_model.get_input_embeddings().weight.shape[0]}")
+
 
     print(f"Actor model loaded from {actor_model_path}")
     
@@ -546,19 +467,18 @@ def main():
     train_dataset = RewardActionDataset(data_args, tokenizer, stage=model_args.stage)
     
     # 准备回调
-    callbacks = []
-    if training_args.report_to and "wandb" in training_args.report_to:
-        callbacks.append(WandbLoggingCallback())
+    # callbacks = []
+    # if training_args.report_to and "wandb" in training_args.report_to:
+    #     callbacks.append(WandbLoggingCallback())
     
 
     # Initialize trainer with both models
     trainer = Stage2DualModelTrainer(
-        env_model_client=env_model_client,  # 使用客户端
-        model=actor_model,    # 动作生成模型(训练)
+        env_model_client=env_model_client,  
+        model=actor_model,   
         args=training_args,
         train_dataset=train_dataset,
-        tokenizer=tokenizer,
-        callbacks=callbacks
+        tokenizer=tokenizer
     )
     
     # Train

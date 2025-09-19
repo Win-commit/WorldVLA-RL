@@ -29,10 +29,10 @@ class EnvModelServer:
         
         # 使用指定的GPU设备
         self.device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
-        logger.info(f"[Server {port}] Using GPU device: {self.device}")
+        # logger.info(f"[Server {port}] Using GPU device: {self.device}")
         
         # 加载环境模型
-        logger.info(f"[Server {port}] Loading tokenizer from {model_path}")
+        # logger.info(f"[Server {port}] Loading tokenizer from {model_path}")
         self.tokenizer = Emu3Tokenizer.from_pretrained(model_path, trust_remote_code=True)
         config = Emu3RewardConfig.from_pretrained(model_path)
         
@@ -80,19 +80,19 @@ class EnvModelServer:
             logger.info(f"[Server {self.port}] New connection from {client_id} (request #{request_id})")
             async for message in websocket:
                 start_time = time.time()
-                logger.info(f"[Server {self.port}] Processing request #{request_id} from {client_id}")
+                # logger.info(f"[Server {self.port}] Processing request #{request_id} from {client_id}")
                 
                 # 接收二进制数据并反序列化
                 data = pickle.loads(message)
-                logger.info(f"[Server {self.port}] Request #{request_id}: Data received and deserialized, "
-                           f"batch_size={len(data['text_ids_list'])}")
+                # logger.info(f"[Server {self.port}] Request #{request_id}: Data received and deserialized, "
+                #            f"batch_size={len(data['text_ids_list'])}")
                 
                 text_ids_list = [torch.from_numpy(item) for item in data['text_ids_list']]
                 image_token_ids = torch.from_numpy(data['image_token_ids'])
                 states = torch.from_numpy(data['states'])
                 
                 # 移动数据到设备
-                logger.info(f"[Server {self.port}] Request #{request_id}: Moving tensors to device {self.device}")
+                # logger.info(f"[Server {self.port}] Request #{request_id}: Moving tensors to device {self.device}")
                 text_ids_list = [x.to(self.device) for x in text_ids_list]
                 image_token_ids = image_token_ids.to(self.device)
                 states = states.to(self.device, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
@@ -107,7 +107,7 @@ class EnvModelServer:
                     )
                 
                 # 优化: 仅发送关键hidden_states片段，而不是整个隐藏状态矩阵
-                logger.info(f"[Server {self.port}] Request #{request_id}: Processing hidden states")
+                # logger.info(f"[Server {self.port}] Request #{request_id}: Processing hidden states")
                 hidden_states = reward_results['hidden_states'] 
                 hidden_states_shape = hidden_states.shape 
                 context_lengths = reward_results['context_lengths'] 
@@ -125,7 +125,7 @@ class EnvModelServer:
                     critical_segments.append(critical_segment)
                 
                 # 准备要发送的二进制数据
-                logger.info(f"[Server {self.port}] Request #{request_id}: Preparing response data")
+                # logger.info(f"[Server {self.port}] Request #{request_id}: Preparing response data")
                 serialized_results = {
                     'reward_preds_group_mean': reward_results['reward_preds_group_mean'].cpu().to(torch.float32).numpy(),
                     'best_reward_group': best_reward_group.cpu().numpy(),
@@ -148,8 +148,8 @@ class EnvModelServer:
                 
                 end_time = time.time()
                 self.successful_requests += 1
-                logger.info(f"[Server {self.port}] Request #{request_id} completed in {end_time-start_time:.2f}s "
-                           f"({self.successful_requests}/{self.request_count} successful)")
+                # logger.info(f"[Server {self.port}] Request #{request_id} completed in {end_time-start_time:.2f}s "
+                #            f"({self.successful_requests}/{self.request_count} successful)")
                 
         except Exception as e:
             logger.error(f"[Server {self.port}] Error handling client {client_id}, request #{request_id}: {e}")
