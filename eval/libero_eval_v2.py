@@ -306,6 +306,32 @@ def unormalize_action(action):
     action = 0.5 * (action + 1) * (action_high - action_low) + action_low
     return action
 
+def test_reward(reward_sampling_results,env_model):
+    h = reward_sampling_results['hidden_states']
+    context_len_i = reward_sampling_results['context_lengths'][0]
+    best_idx = reward_sampling_results['best_reward_group'][0].item()
+    group_start = context_len_i + best_idx * (5 + 1)
+    group_end = group_start + 5 + 1
+    selected_reward_hs = h[0:1, group_start:group_end, :]  # [1, G+1, H]
+    
+    # 提取前5个向量 [5, H]
+    vectors = selected_reward_hs[0:1, :5, :]
+    rwd_hat = env_model.reward_head(vectors).squeeze(0)
+    rtg = env_model.rtg_head(selected_reward_hs[0:1, -1, :]).squeeze(0)
+    # 计算前5个向量的方差
+    variance = torch.var(rwd_hat, dim=0)  # 各维度的方差 [H]
+    total_variance = torch.sum(variance).item()  
+    
+    # 还可以计算平均方差作为标准化指标
+    avg_variance = total_variance / rwd_hat.shape[1]
+    
+    return {
+        "total_variance": total_variance,
+        "avg_variance": avg_variance,
+        "reward_hat": rwd_hat,
+        "rtg": rtg,
+    }
+
 def image_level_enc_dec(images, image_tokenizer, image_processor, visual_token_pattern: str = "<|visual token {token_id:0>6d}|>"):
     """批量处理图像：编码并保存代码"""
     images_tensor = image_processor(images, return_tensors="pt")["pixel_values"].to(device)
@@ -320,7 +346,7 @@ def image_level_enc_dec(images, image_tokenizer, image_processor, visual_token_p
         except Exception as e:
             print(f"处理起始于图像 {start_idx} 的批次时出错: {e}")
 
-def get_action(observation, task_description, model, tokenizer, image_processor, image_tokenizer, processor, action_tokenizer, visual_token_pattern="<|visual token {token_id:0>6d}|>", env_model = None):
+def get_action(observation, task_description, model, tokenizer, image_processor, image_tokenizer, processor, action_tokenizer, visual_token_pattern="<|visual token {token_id:0>6d}|>", env_model = None, log_file = None):
     """使用模型获取动作"""
     # 编码图像
     video_code = image_level_enc_dec([observation["full_image"]], image_tokenizer=image_tokenizer, image_processor=image_processor, visual_token_pattern=visual_token_pattern)
@@ -357,6 +383,11 @@ def get_action(observation, task_description, model, tokenizer, image_processor,
                 image_token_ids=image_token_ids,
                 states=states,
             )
+        #==========================验证一下猜想=================================
+        test = test_reward(rewards,env_model)
+        log_message(f"test: {test}", log_file)
+        #=======================================================================
+
         action_outputs = model.generate_actions_inference(
             text_ids_list=text_ids_list,
             image_token_ids=image_token_ids,
@@ -450,7 +481,8 @@ def run_episode(
                 processor,
                 action_tokenizer,
                 cfg.visual_token_pattern,
-                env_model
+                env_model,
+                log_file
             )
             action_queue.extend(actions)
         
@@ -616,7 +648,7 @@ def eval_libero(cfg: EvaluationConfig) -> float:
     num_tasks = task_suite.n_tasks
     
     needToEvaluate = [0,1,2,3,4,5,6,7,8,9]
-    needToEvaluate = [8,9]
+    # needToEvaluate = [8,9]
     # 开始评估
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks)):
@@ -684,7 +716,8 @@ if __name__ == "__main__":
                       help="是否保存回放视频")
     parser.add_argument("--visual_token_pattern", type=str, default="<|visual token {token_id:0>6d}|>",
                       help="视觉token的模式字符串")
-    
+    parser.add_argument("--local_log_dir", type=str, default="/liujinxin/zhy/ICLR2026/eval/logs",
+                      help="本地日志目录")
     args = parser.parse_args()
     
     # 创建配置
@@ -695,9 +728,9 @@ if __name__ == "__main__":
     cfg.parallel_reward_groups = args.parallel_reward_groups
     cfg.reward_group_size = args.reward_group_size
     cfg.num_trials_per_task = args.trials
-    cfg.save_videos = args.save_videos
+    cfg.save_videos = False
     cfg.visual_token_pattern = args.visual_token_pattern
-    
+    cfg.local_log_dir = args.local_log_dir
     # 设置任务套件
     if args.task_suite == "libero_spatial":
         cfg.task_suite_name = TaskSuite.LIBERO_SPATIAL

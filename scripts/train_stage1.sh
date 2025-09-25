@@ -11,13 +11,13 @@ NGPUS=8
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE="stage1"  
-EXP_NAME="STAGE1_TRAINER_Balance_Loss_StateNorm"
+EXP_NAME="STAGE1_BalanceLoss_StateNorm_ValueChunk"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 
 STAGE_ARGS="--stage stage1 --parallel_mode False"
-FRAMES=6
+FRAMES=3
 
 torchrun \
     --nproc_per_node=${NGPUS} \
@@ -44,7 +44,7 @@ torchrun \
     --warmup_steps 50 \
     --per_device_train_batch_size 6 \
     --frames ${FRAMES} \
-    --action_frames 5 \
+    --action_frames 10 \
     --attn_type "flash_attention_2" \
     --action_tokenizer_path "/liujinxin/zhy/ICLR2026/pretrain/fast" \
     --max_position_embeddings 6400 \
@@ -61,4 +61,4 @@ torchrun \
     --remove_unused_columns False \
     --dataloader_pin_memory True \
     --dataloader_drop_last True \
-    --exp_name "STAGE1_TRAINER_Balance_Loss_StateNorm" 
+    --exp_name "STAGE1_BalanceLoss_StateNorm_ValueChunk" 

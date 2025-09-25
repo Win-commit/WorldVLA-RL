@@ -19,7 +19,6 @@ from models.Projectors import ProprioProjector
 from models.emu3_parallel_patch import apply_emu3_parallel_patch, generate_parallel_reward_attention_mask
 from transformers import LogitsProcessor, GenerationConfig
 from transformers.cache_utils import Cache
-
 class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -137,13 +136,14 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         text_ids_list: List,
         image_token_ids: torch.LongTensor,
         states: torch.Tensor,
-        reward_targets: Optional[torch.Tensor] = None,
-        rtg_targets: Optional[torch.Tensor] = None,
+        reward_targets: Optional[torch.Tensor],
+        rtg_targets: Optional[torch.Tensor],
     ):
         """
         Stage1前向传播（reward 感知）
         """
         B, K, L_img = image_token_ids.shape
+        _, _, action_frames, _ = reward_targets.shape
         device = image_token_ids.device
         max_len = self.tokenizer.model_max_length
         
@@ -156,7 +156,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         seq_list = []
         mask_list = []
         label_list = []  # for CE over image tokens
-
+        noise_norms = [] # record noise strength
         for i, text_ids in enumerate(text_ids_list):
             L_text = text_ids.size(0)
             # text embeddings and initial labels
@@ -175,12 +175,19 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 parts += [static['state_beg'], state_embs[i:i+1,j:j+1,:], static['state_end']]
                 labels += [-100, -100, -100]
                 #reward
-                parts += [static['rwd']]
-                labels += [-100]
+                for time_step in range(action_frames):
+                    rwd_vector = static['rwd'].view(-1).float() 
+                    q25 = torch.quantile(rwd_vector, 0.25)
+                    q75 = torch.quantile(rwd_vector, 0.75)
+                    noise = torch.rand(1, self.hidden_dim, device=device, dtype=static['rwd'].dtype) * (q75 - q25) + q25
+                    noise = noise * self.noise_factor
 
-            # RTG tokens
-            parts += [static['rtg']]
-            labels += [-100]
+                    noise_norms.append(torch.norm(noise).item())
+
+                    parts += [static['rwd'] + noise]
+                    parts += [static['rtg'] + noise]
+                    labels += [-100, -100]
+
 
             # concat and pad to max_len
             seq_i = torch.cat(parts, dim=1)  # [1, L_i, H]
@@ -219,8 +226,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100
         )
         # reward/rtg preds
-        reward_preds = []
-        rtg_preds = []
+        reward_positions = []
+        rtg_positions = []
         # compute reward positions and preds
         for i, text_ids in enumerate(text_ids_list):
             # start just after  text
@@ -231,18 +238,29 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 # Skip state segment: state_beg + state token + state_end
                 pos += 3
                 # Now pos points to the reward token
-                reward_preds.append(self.reward_head(h[i:i+1, pos, :]))
-                # Move past reward token
-                pos += 1
-            rtg_preds.append(self.rtg_head(h[i:i+1, pos, :]))
-        reward_preds = torch.stack(reward_preds, dim=1).view(B, K, -1) # [B,K,14]
-        rtg_preds = torch.stack(rtg_preds, dim=0)      # [B,1,14]
+                for time_step in range(action_frames):
+                    reward_positions.append((i, pos))
+                    rtg_positions.append((i, pos + 1))
+                    pos += 2
+
+        batch_indices = [p[0] for p in reward_positions]
+        reward_pos_indices = [p[1] for p in reward_positions]
+        rtg_pos_indices = [p[1] for p in rtg_positions]
+
+        reward_vectors = h[batch_indices, reward_pos_indices] # [B*K*action_frames, hidden_dim]
+        rtg_vectors = h[batch_indices, rtg_pos_indices] # [B*K*action_frames, hidden_dim]
+
+        reward_preds = self.reward_head(reward_vectors).view(B, K*action_frames, -1)
+        rtg_preds = self.rtg_head(rtg_vectors).view(B, K*action_frames, -1)
+        
         rwd_mse = 0
         rtg_mse = 0
         if reward_targets is not None:
+            reward_targets =  reward_targets.contiguous().view(B, K * action_frames, -1)
             rwd_mse += F.mse_loss(reward_preds, reward_targets)
         if rtg_targets is not None:
-            rtg_mse += F.mse_loss(rtg_preds, rtg_targets[:, -1])
+            rtg_targets = rtg_targets.contiguous().view(B, K * action_frames, -1)
+            rtg_mse += F.mse_loss(rtg_preds, rtg_targets)
         # 使用EMA对不同尺度的损失进行自适应加权
         if self.auto_balance_stage1:
             eps = 1e-8
@@ -262,7 +280,10 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 total_loss = total_loss + rtg_w * rtg_mse
         else:
             total_loss = img_ce + rwd_mse + rtg_mse
-
+        
+        avg_noise_norm = sum(noise_norms) / len(noise_norms)
+        rwd_noise_ratio = avg_noise_norm / torch.norm(static['rwd']).item()
+        rtg_noise_ratio = avg_noise_norm / torch.norm(static['rtg']).item()
         return {'loss': total_loss,
                 'vision_loss': img_ce,
                 'reward_loss': None if reward_targets is None else rwd_mse,
@@ -272,6 +293,9 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 'rtg_mse_ema': self.rtg_mse_ema,
                 'balanced_rwd':torch.clamp(self.img_ce_ema.detach() / (self.rwd_mse_ema.detach() + 1e-8), 0.1, 10.0) * rwd_mse,
                 'balanced_rtg':torch.clamp(self.img_ce_ema.detach() / (self.rtg_mse_ema.detach() + 1e-8), 0.1, 10.0) * rtg_mse,
+                'noise_norm': avg_noise_norm,
+                'rwd_noise_ratio': rwd_noise_ratio,
+                'rtg_noise_ratio': rtg_noise_ratio,
                 'logits': logits,
                 'reward_preds': reward_preds,
                 'rtg_pred': rtg_preds}
@@ -453,7 +477,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 sample_reward_preds.append(group_total)
             
             # Stack all group predictions for this sample
-            reward_preds.extend(sample_reward_preds)  # M predictions per sample
+            reward_preds.extend(sample_reward_preds)  # M(group nums) predictions per sample
         
         # Reshape reward and rtg predictions: [B*M, reward_dim] -> [B, M, reward_dim]
         reward_preds = torch.stack(reward_preds, dim=0).view(B, self.parallel_reward_groups, -1)
@@ -771,7 +795,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
     ):
         """
         Stage2前向传播（并行奖励采样）
-        
+        (荒废)
         Args:
             text_ids_list: 文本ID列表
             image_token_ids: 图像token IDs
@@ -779,9 +803,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             action_token_ids: 动作token IDs (用于训练/评估)
             reward_targets: 奖励目标
             rtg_targets: RTG目标
-            p: 执行奖励采样的概率，范围[0,1]，默认为1.0(100%采样)
         """
-        # 第一步：根据概率p决定是否进行并行奖励采样
         reward_sampling_results = None
         if torch.rand(1).item() < self.p:
             reward_sampling_results = self.sample_rewards(
@@ -984,7 +1006,6 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         
         # 迭代生成max_new_tokens个token
         for i in range(max_new_tokens):
-            # 1. 前向传播
             model_inputs = {
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
@@ -995,19 +1016,14 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 outputs = self.model(**model_inputs)
             hidden_states = outputs.last_hidden_state
             
-            # 2. 计算下一个token的logits
             next_token_logits = self.lm_head(hidden_states[:, -1, :])
             
-            # 3. 应用logits处理
             for processor in logits_processor:
                 next_token_logits = processor(input_ids, next_token_logits)
             
-            # 4. 根据策略选择下一个token
             if do_sample:
-                # 应用温度
                 next_token_logits = next_token_logits / temperature
                 
-                # 应用top_p采样
                 if top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
                     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -1022,35 +1038,27 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                         indices_to_remove = sorted_indices[batch_idx][sorted_indices_to_remove[batch_idx]]
                         next_token_logits[batch_idx, indices_to_remove] = -float("inf")
                 
-                # 采样
                 probs = F.softmax(next_token_logits, dim=-1)
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
-                # 贪婪搜索
                 next_tokens = torch.argmax(next_token_logits, dim=-1)
             
-            # 5. 保存分数
             if output_scores:
                 scores.append(next_token_logits)
             
-            # 6. 将生成的token添加到结果中
             input_ids = torch.cat([input_ids, next_tokens.unsqueeze(-1)], dim=-1)
             all_token_ids = torch.cat([all_token_ids, next_tokens.unsqueeze(-1)], dim=-1)
             
-            # 7. 将token转为embedding并添加到inputs_embeds
             token_embeds = torch.index_select(word_embeddings, 0, next_tokens).unsqueeze(1)  # [batch_size, 1, hidden_dim]
             inputs_embeds = torch.cat([inputs_embeds, token_embeds], dim=1)
             
-            # 8. 更新attention_mask
             if attention_mask is not None:
                 attention_mask = torch.cat([
                     attention_mask, 
                     torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=device)
                 ], dim=1)
             
-            # 9. 检查是否有序列已完成
             if eos_token_id is not None and torch.any(next_tokens == eos_token_id):
-                # 如果所有序列都生成了eos，则停止
                 if torch.all(next_tokens == eos_token_id):
                     break
             

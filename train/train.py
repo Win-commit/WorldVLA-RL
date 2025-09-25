@@ -24,10 +24,10 @@ class ModelArguments:
     stage: str = field(default="stage1", metadata={"help": "训练阶段: stage1 或 stage2"})
     parallel_mode: bool = field(default=True, metadata={"help": "是否启用并行奖励采样模式(stage2专用)"})
     parallel_reward_groups: int = field(default=5, metadata={"help": "并行奖励组数(stage2专用)"})
-    reward_group_size: int = field(default=10, metadata={"help": "每组奖励token数量(stage2专用)"})
+    reward_group_size: int = field(default=10, metadata={"help": "每组奖励数(不含state value)"})
     p: float = field(default=0.85, metadata={"help": "stage2执行奖励采样的概率"})
     gamma: float = field(default=0.9, metadata={"help": "时间加权参数(stage2专用)"})
-    noise_factor: float = field(default=0.1, metadata={"help": "噪声因子(stage2专用)"})
+    noise_factor: float = field(default=0.4, metadata={"help": "噪声因子"})
 
 @dataclass
 class DataArguments:
@@ -133,6 +133,9 @@ class UnifiedRewardTrainer(Trainer):
                     "rtg_mse_ema": outputs["rtg_mse_ema"].item(),
                     "balanced_rwd": outputs["balanced_rwd"].item(),
                     "balanced_rtg": outputs["balanced_rtg"].item(),
+                    "noise_norm": outputs["noise_norm"],
+                    "rwd_noise_ratio": outputs["rwd_noise_ratio"],
+                    "rtg_noise_ratio": outputs["rtg_noise_ratio"]
                 })
             
         else:  # stage2
@@ -238,8 +241,6 @@ def main():
 
     # 设置模型训练模式
     model.set_mode(parallel_mode=model_args.parallel_mode)
-    print(f"Model mode set to: parallel_mode={model_args.parallel_mode}")
-    print(f"model embedding size: {model.get_input_embeddings().weight.shape[0]}")
 
     # Enable gradient checkpointing if specified
     if training_args.gradient_checkpointing:

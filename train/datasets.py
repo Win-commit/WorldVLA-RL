@@ -108,14 +108,14 @@ class RewardActionDataset(Dataset):
         state_tensor = torch.stack(state_tensor, dim=0)
 
         # RTG
-        rtg_tensor = torch.from_numpy(rtg_list[start_idx + T])
-
+        selected_rtg = rtg_list[start_idx + 1:start_idx + T + 1]
+        rtg_tensor = [torch.from_numpy(r) for r in selected_rtg]
+        rtg_tensor = torch.stack(rtg_tensor, dim=0)
+        
         # Gripper图像（stage2专用）
         gripper_tensor = None
         if gripper_list is not None:
             selected_gripper = [np.load(p) for p in gripper_list[start_idx:start_idx + T]]
-            # if self.is_main_process:
-            #     print(len(selected_gripper))
             gripper_tensor = [torch.from_numpy(frame) for frame in selected_gripper]
             gripper_tensor = torch.stack(gripper_tensor, dim=1)
 
@@ -152,8 +152,6 @@ class RewardActionDataset(Dataset):
         else:
             frames_num = (len(image_tokens_path) // self.action_frames) * self.action_frames
         
-        # if self.is_main_process:
-        #     print(image_tokens_path[0])
             
         image_tokens, reward_tensor, state_tensor, rtg_tensor, gripper_tokens, action_tensors = self.random_frames_to_tensor(
             image_tokens_path, rewards, rtgs, states, gripper_paths, actions_raw, frames_num
@@ -165,8 +163,9 @@ class RewardActionDataset(Dataset):
         # 以 action_frames 为步长做抽帧，得到 K 帧
         image_tokens = image_tokens[0::self.action_frames, ...]
         states_k = state_tensor[0::self.action_frames, ...]
-        rewards_k = reward_tensor[0::self.action_frames, ...]
-        
+        # rewards_k = reward_tensor[0::self.action_frames, ...]
+        reward_tensor = reward_tensor.reshape(self.group, self.action_frames, -1)
+        rtg_tensor = rtg_tensor.reshape(self.group, self.action_frames, -1)
         if gripper_tokens is not None:
             gripper_tokens = gripper_tokens[0::self.action_frames, ...]
 
@@ -199,21 +198,20 @@ class RewardActionDataset(Dataset):
             image_token_ids.append(tokenized)
 
         image_token_ids = torch.cat(image_token_ids, dim=0)  # [K, L_img]
-        rtg = rtg_tensor.unsqueeze(0).unsqueeze(0)  # [1,1, reward_dim]
 
         return {
             'text_ids': text_ids,
             'image_token_ids': image_token_ids,   # [K, L_img]
             'states': states_k,                   # [K, state_dim]
-            'reward': rewards_k,                  # [K, reward_dim]
-            'rtg': rtg,                           # [1,1, reward_dim]
+            'reward': reward_tensor,                  # [K,action_frames, reward_dim]
+            'rtg': rtg_tensor,                           # [K,action_frames, reward_dim]
             'action_token_ids': action_ids,       #stage1为空
         }
 
 
 def RewardAction_collate(batch: List[Dict[str, Any]]):
     """
-    统一的collate函数,兼容stage1和stage2
+    统一的collate函数
     """
     text_ids_list = [b['text_ids'] for b in batch]
     image_token_ids = torch.stack([b['image_token_ids'] for b in batch], dim=0)

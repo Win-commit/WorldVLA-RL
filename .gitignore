@@ -4,5 +4,8 @@ test/
 logs/
 train/trush/
 eval/logs/
+eval/ablation/
 datasets/libero/data/
 ckpts/
+id_rsa_lrz
+id_rsa_lrz.pub

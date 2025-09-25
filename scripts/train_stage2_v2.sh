@@ -11,7 +11,7 @@ wandb login $API_KEY
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE=${1:-stage2}  
-EXP_NAME="STAGE2_TRAINER_STAGE1EMABalance_StateNorm_EnvActor"
+EXP_NAME="STAGE2_TRAINER_STAGE1EMABalance_StateNorm_Actor_UNIVLA8k"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -22,7 +22,7 @@ if [ "$STAGE" = "stage1" ]; then
     STAGE_ARGS="--stage stage1 --parallel_mode False"
     FRAMES=6
 else
-    STAGE_ARGS="--stage stage2 --parallel_mode True --parallel_reward_groups 10 --reward_group_size 5 --gamma 0.9 --noise_factor 0.4 --p 1"
+    STAGE_ARGS="--stage stage2 --parallel_mode True --parallel_reward_groups 10 --reward_group_size 10 --gamma 0.9 --noise_factor 0.4 --p 1"
     FRAMES=1
 fi
 
@@ -96,8 +96,9 @@ torchrun \
     --remove_unused_columns False \
     --dataloader_pin_memory True \
     --dataloader_drop_last True  \
-    --exp_name "STAGE2_TRAINER_STAGE1EMABalance_StateNorm_EnvActor" \
-    --report_to "wandb" 
+    --exp_name "STAGE2_TRAINER_STAGE1EMABalance_StateNorm_Actor_UNIVLA8k" \
+    --report_to "wandb" \
+    --resume_from_checkpoint "/liujinxin/zhy/ICLR2026/logs/STAGE2_TRAINER_STAGE1EMABalance_StateNorm_Actor_UNIVLA8k/checkpoint-7500"
 
 for PID in "${SERVER_PIDS[@]}"; do
     echo "Killing server with PID: $PID"

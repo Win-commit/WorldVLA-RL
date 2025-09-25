@@ -11,6 +11,7 @@ from transformers import (
     TrainerCallback
 )
 from models.univla_rl_unified import Emu3UnifiedRewardModel
+from models.Emu3.emu3.mllm.modeling_emu3 import Emu3MoE,Emu3Model
 from models.Emu3.emu3.mllm.tokenization_emu3 import Emu3Tokenizer
 from models.Emu3.emu3.mllm.configuration_emu3 import Emu3Config, Emu3RewardConfig
 from datasets import RewardActionDataset, RewardAction_collate
@@ -451,6 +452,14 @@ def main():
         attn_implementation=training_args.attn_type,
         torch_dtype=torch.bfloat16 if training_args.bf16 else None,
     )
+
+    actor_model.model = Emu3Model.from_pretrained(
+        "/liujinxin/zhy/UniVLA/logs/UNIVLA_LIBERO_VIDEO_BS192_8k_reproduce/checkpoint-8000",
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        trust_remote_code=True,
+    )
+
 
     rank = getattr(training_args, 'local_rank', 0)
     env_model_client = EnvModelClient(servers=servers, rank=rank)
