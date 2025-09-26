@@ -11,6 +11,10 @@ from pdb import set_trace
 import random 
 from typing import Any, Callable, Dict, Optional, Protocol, Tuple, Union, List
 from torch.cuda.amp import autocast
+
+# 添加分布式训练相关导入
+import torch.distributed as dist
+
 from models.reward_heads import RwdHead, RtgHead
 from models.Emu3.emu3.mllm.modeling_emu3 import Emu3PreTrainedModel, Emu3Model
 from models.Emu3.emu3.mllm.tokenization_emu3 import Emu3Tokenizer
@@ -300,14 +304,44 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 'reward_preds': reward_preds,
                 'rtg_pred': rtg_preds}
 
+    def select_best_reward_groups(self, reward_preds, rtg_preds):
+        """        
+        Args:
+            reward_preds: [B,K,M,10,14]
+            rtg_preds: [B,K,M,10,14]
+            
+        Returns:
+            best_group_indices: [B,K]
+        """
+        B, K, M, _, _ = reward_preds.shape
+        device = reward_preds.device
+        rewards = reward_preds[:, :, :, :self.reward_group_size, -1]  # [B,K,M,reward_group_size]
+        final_rtg = rtg_preds[:, :, :, self.reward_group_size-1, -1] 
+        
+        time_weights = torch.pow(
+            torch.tensor(self.gamma, device=device), 
+            torch.arange(self.reward_group_size, device=device)
+        )  # [reward_group_size]
+        
+        weighted_rewards = rewards * time_weights.view(1, 1, 1, -1)  # [B,K,M,reward_group_size]
+        
+        summed_rewards = weighted_rewards.sum(dim=-1)  # [B,K,M]
+        rtg_weight = torch.pow(torch.tensor(self.gamma, device=device), torch.tensor(self.reward_group_size, device=device))
+        final_scores = summed_rewards + rtg_weight * final_rtg  # [B,K,M]
+        
+        best_group_indices = torch.argmax(final_scores, dim=2)  # [B,K]
+        
+        return best_group_indices
+
     def sample_rewards(self,
         text_ids_list: List,
         image_token_ids: torch.LongTensor,
-        states: torch.Tensor
+        states: torch.Tensor,
+        history: Optional[Dict] = None # for inference only
     ):
         """
         阶段2.1: 并行奖励采样部分，仅负责生成并行奖励组并选择最佳奖励组
-        
+        <text>+(<img>+<state_beg>+<state>+<state_end>+(<rwd_beg>+(<rwd>+<rtg>)*10+<rwd_end>)*M)*K
         Args:
             text_ids_list: 文本ID列表
             image_token_ids: 图像token IDs
@@ -315,6 +349,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             
         Returns:
             dict: 包含reward采样结果、最佳奖励组索引、隐藏状态等
+            
         """
         B, K, L_img = image_token_ids.shape
         device = image_token_ids.device
@@ -338,11 +373,13 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         context_lengths = []  # Track context length for each sample
 
         for i, text_ids in enumerate(text_ids_list):
+            context_length_ind = []
             L_text = text_ids.size(0)
             # text embeddings and initial labels
             t_emb = self.get_input_embeddings()(text_ids.unsqueeze(0))  # [1,L_text,H]
             parts = [t_emb]
-
+            if history is not None:
+                pass # TODO: add history
             # per-frame segments (assuming K=1 for parallel reward sampling)
             for j in range(K):
                 # image
@@ -351,39 +388,44 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 parts.append(emb_ij)
                 # state_beg, state, state_end
                 parts += [static['state_beg'], state_embs[i:i+1,j:j+1,:], static['state_end']]
-            parts += [static['rwd_beg']]
-            # Calculate context length (text + images + states)
-            # Each group now has reward_group_size + 1 tokens (including rtg)
-            context_len = L_text + K * (L_img + 3) + 1  # 3 for state_beg, state, state_end, 1 for rwd_beg
-            context_lengths.append(context_len)
+                parts += [static['rwd_beg']]
+                # Calculate context length (text + images + states)
+                # Each group now has reward_group_size + 1 tokens (including rtg)
+                context_len = L_text + (L_img + 3) + 1  # 3 for state_beg, state, state_end, 1 for rwd_beg
+                if history is not None:
+                    context_len += 0 # TODO: add history length
+                if context_length_ind == []:
+                    context_length_ind.append(context_len)
+                else:
+                    group_len = self.parallel_reward_groups * 20 + 1
+                    context_length_ind.append(context_length_ind[-1] + group_len + (L_img + 3) + 1)
             
-            # Add parallel reward groups
-            for group_idx in range(self.parallel_reward_groups):
-                rwd_vector = static['rwd'].view(-1).float() 
-                q25 = torch.quantile(rwd_vector, 0.25)
-                q75 = torch.quantile(rwd_vector, 0.75)
-                
-                # Sample uniformly between 25th and 75th percentiles
-                group_noise = torch.rand(1, self.hidden_dim, device=device, dtype=static['rwd'].dtype) * (q75 - q25) + q25
-                group_noise = group_noise * self.noise_factor
-                
-                # Calculate and record the current noise level
-                noise_norm = torch.norm(group_noise).item()
-                all_noise_norms.append(noise_norm)
-                
-                # Add reward tokens with noise
-                for token_idx in range(self.reward_group_size):
-                    rwd_emb = static['rwd'] + group_noise
-                    parts += [rwd_emb]
-                
-                # Add rtg token at the end of each group with noise
-                rtg_emb = static['rtg'] + group_noise
-                parts += [rtg_emb]
-            
-            parts += [static['rwd_end']]
+                # Add parallel reward groups
+                for group_idx in range(self.parallel_reward_groups):
+                    rwd_vector = static['rwd'].view(-1).float() 
+                    q25 = torch.quantile(rwd_vector, 0.25)
+                    q75 = torch.quantile(rwd_vector, 0.75)
+                    
+                    # Sample uniformly between 25th and 75th percentiles
+                    group_noise = torch.rand(1, self.hidden_dim, device=device, dtype=static['rwd'].dtype) * (q75 - q25) + q25
+                    group_noise = group_noise * self.noise_factor
+                    
+                    # Calculate and record the current noise level
+                    noise_norm = torch.norm(group_noise).item()
+                    all_noise_norms.append(noise_norm)
+                    
+                    # Add reward tokens&rtg tokens with noise
+                    for token_idx in range(10):
+                        rwd_emb = static['rwd'] + group_noise
+                        rtg_emb = static['rtg'] + group_noise
+                        parts += [rwd_emb]
+                        parts += [rtg_emb]
+                    
+                parts += [static['rwd_end']]
 
             # concat and pad to max_len
             seq_i = torch.cat(parts, dim=1)  # [1, L_i, H]
+            context_lengths.append(context_length_ind)
             
             L_i = seq_i.size(1)
             if L_i < max_len:
@@ -407,15 +449,20 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         # Generate individual masks for each sample since context_len varies
         custom_4d_masks = []
         for i in range(B):
-            context_len = context_lengths[i]
-            sample_mask = generate_parallel_reward_attention_mask(
-                seq_length=seq_len,
-                context_len=context_len,
-                reward_groups=self.parallel_reward_groups,
-                reward_group_size=self.reward_group_size + 1,
-                device=device
-            )
-            
+            context_length_ind = context_lengths[i]
+            reverse_context_length_ind = context_length_ind[::-1]
+            sample_mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).unsqueeze(0).unsqueeze(0)
+            for prefix_length in reverse_context_length_ind:
+                sample_mask_part = generate_parallel_reward_attention_mask(
+                    seq_length=prefix_length + self.reward_group_size * 20 + 1,
+                    context_len=prefix_length,
+                    reward_groups=self.parallel_reward_groups,
+                    reward_group_size=20,
+                    device=device
+                )
+                part_len = sample_mask_part.size(-1)
+                sample_mask[:, :, :part_len, :part_len] = sample_mask_part
+
             # Apply padding mask for this sample
             valid_length = int(attention_mask[i].sum().item())
             if valid_length < seq_len:
@@ -438,53 +485,36 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         
         # reward/rtg preds with parallel sampling
         reward_preds = []
-        
+        reward_pos = []
+        rtg_pos = []
         for i, text_ids in enumerate(text_ids_list):
-            pos = context_lengths[i]
             
             # Parallel reward sampling: predict from all reward groups
             sample_reward_preds = []
-            
-            for group_idx in range(self.parallel_reward_groups):
-                group_start_pos = context_lengths[i] + group_idx * (self.reward_group_size + 1)  # +1 for rtg
-                
-                # Collect all tokens in this group (rewards + rtg) for time-weighted aggregation
-                group_tokens = []
-                group_weights = []
-                
-                # Decode reward tokens
-                for token_idx in range(self.reward_group_size):
-                    current_pos = group_start_pos + token_idx
-                    hidden_state = h[i:i+1, current_pos, :]
-                    reward_pred = self.reward_head(hidden_state)
-                    group_tokens.append(reward_pred)
-                    group_weights.append(torch.pow(torch.tensor(self.gamma, device=h.device), token_idx + 1))  # gamma^1, gamma^2, ..., gamma^group_size
-                
-                # Decode rtg token (last token in the group)
-                rtg_pos = group_start_pos + self.reward_group_size
-                rtg_hidden_state = h[i:i+1, rtg_pos, :]
-                rtg_pred = self.rtg_head(rtg_hidden_state)
-                group_tokens.append(rtg_pred)
-                group_weights.append(torch.pow(torch.tensor(self.gamma, device=h.device), self.reward_group_size + 1))  # gamma^(group_size+1)
-                
-                # Time-weighted aggregation: gamma^1*rwd1 + gamma^2*rwd2 + ... + gamma^(group_size+1)*rtg
-                # Stack all predictions and apply time weights
-                tokens_stack = torch.stack(group_tokens, dim=0)  # [group_size+1, 1, dim]
-                weights_tensor = torch.tensor(group_weights, device=h.device, dtype=tokens_stack.dtype).unsqueeze(1).unsqueeze(2)  # [group_size+1, 1, 1]
-                weighted_tokens = tokens_stack * weights_tensor
-                group_total = weighted_tokens.sum(dim=0)  # [1, dim]
-
-                sample_reward_preds.append(group_total)
-            
-            # Stack all group predictions for this sample
-            reward_preds.extend(sample_reward_preds)  # M(group nums) predictions per sample
+            for k in range(K):
+                for group_idx in range(self.parallel_reward_groups):
+                    group_start_pos = context_lengths[i][k] + group_idx * (20)   
+                    
+                    # Decode reward tokens
+                    for token_idx in range(20):
+                        current_pos = group_start_pos + token_idx
+                        if token_idx % 2 == 0:
+                            reward_pos.append((i, current_pos))
+                        else:
+                            rtg_pos.append((i, current_pos))
         
-        # Reshape reward and rtg predictions: [B*M, reward_dim] -> [B, M, reward_dim]
-        reward_preds = torch.stack(reward_preds, dim=0).view(B, self.parallel_reward_groups, -1)
+        batch_indices = [p[0] for p in reward_pos]
+        reward_pos_indices = [p[1] for p in reward_pos] # [B*K*M*10]
+        rtg_pos_indices = [p[1] for p in rtg_pos]
 
-        # 选择最大 reward 的组
-        reward_scores = reward_preds.mean(dim=-1)  # [B, M]
-        best_group_indices = torch.argmax(reward_scores, dim=1)  # [B]
+        reward_vectors = h[batch_indices, reward_pos_indices] # [B*K*M*10, hidden_dim]
+        rtg_vectors = h[batch_indices, rtg_pos_indices] # [B*K*M*10, hidden_dim]
+        
+        reward_preds = self.reward_head(reward_vectors).view(B, K, self.parallel_reward_groups, 10, -1) # [B,K,M,10,14]
+        rtg_preds = self.rtg_head(rtg_vectors).view(B, K, self.parallel_reward_groups, 10, -1) # [B,K,M,10,14]
+
+        best_group_indices = self.select_best_reward_groups(reward_preds, rtg_preds)
+            
         if self.detach_selected_reward_hs:
             h = h.detach()
             
@@ -493,13 +523,26 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         rwd_noise_ratio = avg_noise_norm / reward_scale if reward_scale > 0 else 0
         rtg_noise_ratio = avg_noise_norm / rtg_scale if rtg_scale > 0 else 0
         
+        #方便后续使用，直接把需要的reward和rtg返回
+        critical_segments = []
+        for i in range(B):
+            for k in range(K):
+                best_idx = best_group_indices[i, k].item()
+                group_start = context_lengths[i][k] + best_idx * (20)
+                for token_idx in range(self.reward_group_size):
+                    critical_segments.append(h[i:i+1, group_start+token_idx*2, :])
+                critical_segments.append(h[i:i+1, group_start + self.reward_group_size*2 - 1, :])
+        critical_segments = torch.cat(critical_segments, dim=0)  # [B*K*(S+1), dim]
+        critical_segments = critical_segments.view(B, K, self.reward_group_size + 1, -1)
+        
         # 返回奖励采样结果和模型状态
         return {
             'logits': logits,
-            'reward_preds_group_mean': reward_preds,
-            'best_reward_group': best_group_indices,
-            'hidden_states': h,
-            'context_lengths': context_lengths,
+            'reward_preds_group_mean': torch.mean(reward_preds[..., -1], dim=-1),
+            'best_reward_group': best_group_indices, # [B,K]
+            'hidden_states': h, # [B,max_len,H]
+            'critical_segments': critical_segments, # [B,K,S+1,H]
+            'context_lengths': context_lengths, # [B,K]
             'reward_embedding_norm': reward_scale,
             'noise_norm': avg_noise_norm,
             'rwd_noise_ratio': rwd_noise_ratio,
@@ -541,14 +584,10 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         has_reward = reward_sampling_results is not None
         
         # 如果有reward_sampling_results，获取必要信息
-        h = None
-        context_lengths = None
-        best_group_indices = None
+        critical_segments = None
         
         if has_reward:
-            h = reward_sampling_results['hidden_states']
-            context_lengths = reward_sampling_results['context_lengths']
-            best_group_indices = reward_sampling_results['best_reward_group']
+            critical_segments = reward_sampling_results['critical_segments']
         
         seq2_list = []
         mask2_list = []
@@ -569,55 +608,37 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 parts2 += [static['state_beg'], state_embs[i:i+1, j:j+1, :], static['state_end']]
                 labels2 += [-100, -100, -100]  # state标记不计算loss
 
-            # 如果有reward信息，添加reward相关token
-            if has_reward and context_lengths is not None and best_group_indices is not None and h is not None:
-                # rwd_beg
-                parts2 += [static['rwd_beg']]
-                labels2 += [-100]
-
-                # 选中组的 reward hidden states（来自第一次前向的最后隐状态）
-                context_len_i = context_lengths[i]
-                best_idx = best_group_indices[i].item()
-                group_start = context_len_i + best_idx * (self.reward_group_size + 1)  # +1 for rtg
-                group_end = group_start + self.reward_group_size + 1  # +1 for rtg
-                selected_reward_hs = h[i:i+1, group_start:group_end, :]  # [1, G+1, H]
-                if self.detach_selected_reward_hs:
-                    selected_reward_hs = selected_reward_hs.detach()
-                parts2.append(selected_reward_hs)
-                labels2 += [-100] * (self.reward_group_size + 1)  # reward + rtg部分不计算loss
-                parts2.append(static['rwd_end'])
-                labels2 += [-100]
-            
-            # 追加 action chunk：boa + action_ids + eoa
-            boa_emb = static['boa']
-            eoa_emb = static['eoa']
-            parts2.append(boa_emb)
-            labels2 += [-100]  # boa不计算loss
-            
-            act_ids_i = action_token_ids[i][0].to(device).view(1, -1)
-            act_len_i = act_ids_i.size(1)
-            act_emb_i = self.get_input_embeddings()(act_ids_i)  # [1, T, H]
-            parts2.append(act_emb_i)
-            labels2 += act_ids_i.view(-1).tolist()  # action部分计算loss
-            parts2.append(eoa_emb)
-            labels2 += [-100]  # eoa不计算loss
-
-            # 计算第二次序列中 action logits 的起始位置与长度
-            if has_reward:
-                # 上下文：text + K*(img + 3个state标记/嵌入) + 1(rwd_beg) + (G+1)(选中组的reward+rtg hs) + 1(rwd_end)
-                context2_len = L_text + K * (L_img + 3) + 1 + (self.reward_group_size + 1) + 1
-            else:
-                # 上下文：text + K*(img + 3个state标记/嵌入) 
-                context2_len = L_text + K * (L_img + 3)
+                # 如果有reward信息，添加reward相关token
+                if has_reward :
+                    # rwd_beg
+                    parts2 += [static['rwd_beg']]
+                    labels2 += [-100]
+                    selected_reward_hs = critical_segments[i, j, :, :].unsqueeze(0)  # [1, G+1, H]
+                    if self.detach_selected_reward_hs:
+                        selected_reward_hs = selected_reward_hs.detach()
+                    parts2.append(selected_reward_hs)
+                    assert self.reward_group_size + 1 == selected_reward_hs.size(1), f"reward_group_size: {self.reward_group_size}, selected_reward_hs.size(1): {selected_reward_hs.size(1)}"
+                    labels2 += [-100] * (self.reward_group_size + 1)  # reward + rtg部分不计算loss
+                    parts2.append(static['rwd_end'])
+                    labels2 += [-100]
                 
-            boa_pos = context2_len
-            action_start = boa_pos  # 对应预测第一个 action token 的 logits 起点
-            action_len = act_len_i
+                # 追加 action chunk：boa + action_ids + eoa
+                boa_emb = static['boa']
+                eoa_emb = static['eoa']
+                parts2.append(boa_emb)
+                labels2 += [-100]  # boa不计算loss
+                
+                act_ids_ij = action_token_ids[i][j].to(device).view(1, -1)
+                act_len_ij = act_ids_ij.size(1)
+                act_emb_ij = self.get_input_embeddings()(act_ids_ij)  # [1, T, H]
+                parts2.append(act_emb_ij)
+                labels2 += act_ids_ij.view(-1).tolist()  # action部分计算loss
+                parts2.append(eoa_emb)
+                labels2 += [-100]  # eoa不计算loss
 
             # 拼接为单条序列
             seq2_i = torch.cat(parts2, dim=1)  # [1, L2_i, H]
             labels2_i = torch.tensor(labels2, device=device, dtype=torch.long)
-
             # padding 或 截断
             L2_i = seq2_i.size(1)
             if L2_i < max_len:
@@ -629,20 +650,15 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 seq2_i = seq2_i[:, :max_len, :]
                 labels2_i = labels2_i[:max_len]
                 mask2_i = torch.ones(max_len, device=device)
-                valid_len = max_len
-                if action_start + action_len > valid_len:
-                    action_len = max(0, valid_len - action_start)
 
             seq2_list.append(seq2_i)
             mask2_list.append(mask2_i.unsqueeze(0))
             action_labels_list.append(labels2_i.unsqueeze(0))
-            action_pos_ranges.append((action_start, action_len))
 
         # batch 合并并进行第二次前向
         inputs_embeds_2 = torch.cat(seq2_list, dim=0)  # [B, max_len, H]
         attention_mask_2 = torch.cat(mask2_list, dim=0)  # [B, max_len]
         action_labels = torch.cat(action_labels_list, dim=0)  # [B, max_len]
-
         outputs2 = self.model(
             inputs_embeds=inputs_embeds_2,
             attention_mask=attention_mask_2,
@@ -659,14 +675,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             ignore_index=-100
         )
 
-        per_sample_logits = []
-        for bi in range(B):
-            start_i, len_i = action_pos_ranges[bi]
-            per_sample_logits.append(logits2[bi, start_i:start_i+len_i, :])  # [len_i, V]
-        action_logits = per_sample_logits  # list，每个元素shape: [T_i, V]
-
         return {
-            'action_logits': action_logits,
             'action_ce_loss': action_ce_loss,
         }
 
@@ -681,7 +690,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         action_dim=7,
         time_horizon=10,
         do_sample=False,
-        auto_sample_reward=True
+        auto_sample_reward=True,
+        history = None
     ):
         """
         用于推理时生成动作序列
@@ -713,11 +723,11 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             )
         
         # 检查reward_sampling_results的有效性（如果有）
-        if reward_sampling_results is not None and ("best_reward_group" not in reward_sampling_results or "hidden_states" not in reward_sampling_results):
+        if reward_sampling_results is not None:
             raise ValueError("Invalid reward_sampling_results provided")
         
         # 构建前缀序列
-        prefix_inputs = self._prepare_action_prefix(text_ids_list, image_token_ids, states, reward_sampling_results)
+        prefix_inputs = self._prepare_action_prefix(text_ids_list, image_token_ids, states, reward_sampling_results, history)
         
         # 设置生成配置
         eoa_token_id = self.ids.get('eoa', 151845)  # eoa token id
@@ -813,7 +823,6 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             )
         
         # 第二步：如果提供了action_token_ids，则进行动作生成
-        action_logits = None
         action_ce_loss = None
         
         if action_token_ids is not None:
@@ -825,12 +834,10 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 reward_sampling_results=reward_sampling_results
             )
             
-            action_logits = action_generation_results['action_logits']
             action_ce_loss = action_generation_results['action_ce_loss']
         
         # 合并结果并返回
         result = {
-            'action_logits': action_logits,
             'action_ce_loss': action_ce_loss,
         }
         
@@ -847,7 +854,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         
         return result
 
-    def set_mode(self, parallel_mode: bool = None):
+    def set_mode(self, parallel_mode: bool):
         """
         Args:
             parallel_mode: 如果为True，使用并行reward采样模式（Stage2）；如果为False，使用单个reward模式（Stage1）
@@ -860,7 +867,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             if not old_mode and parallel_mode:
                 apply_emu3_parallel_patch(self.model)
     
-    def set_parallel_reward_config(self, parallel_reward_groups: int = None, reward_group_size: int = None):
+    def set_parallel_reward_config(self, parallel_reward_groups: Optional[int] = None, reward_group_size: Optional[int] = None):
         """
         Args:
             parallel_reward_groups: 并行奖励组数（M）
@@ -872,7 +879,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             self.reward_group_size = reward_group_size 
 
 
-    def _prepare_action_prefix(self, text_ids_list, image_token_ids, states, reward_sampling_results):
+    def _prepare_action_prefix(self, text_ids_list, image_token_ids, states, reward_sampling_results, history = None):
         """
         构建完整的前缀序列，包括文本、图像、状态和最佳奖励组
         
@@ -904,35 +911,25 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         text_ids = text_ids_list[0]
         t_emb = self.get_input_embeddings()(text_ids.unsqueeze(0))
         prefix_parts.append(t_emb)
-        
+
+        if history is not None:
+            pass # TODO: add history
+
         # 2. 图像和状态部分
         K = image_token_ids.shape[1]  # 图像数量
         for j in range(K):
             prefix_parts.append(img_embs[0:1, j])
             prefix_parts += [static['state_beg'], state_embs[0:1,j:j+1,:], static['state_end']]
         
-        # 3. 如果有奖励信息，添加奖励部分
-        if has_reward:
-            # 奖励部分开始
-            prefix_parts.append(static['rwd_beg'])
+            # 3. 如果有奖励信息，添加奖励部分          
+            if has_reward :
+                    # rwd_beg
+                    prefix_parts += [static['rwd_beg']]
+                    selected_reward_hs = reward_sampling_results["critical_segments"][0, j, :, :].unsqueeze(0)  # [1, G+1, H]
+                    prefix_parts.append(selected_reward_hs)
+                    prefix_parts.append(static['rwd_end'])
             
-            # 选择的最佳奖励组
-            h = reward_sampling_results['hidden_states']
-            context_lengths = reward_sampling_results['context_lengths']
-            best_group_indices = reward_sampling_results['best_reward_group']
             
-            best_idx = best_group_indices[0].item()
-            context_len = context_lengths[0]
-            group_start = context_len + best_idx * (self.reward_group_size + 1)  # +1 for rtg
-            group_end = group_start + self.reward_group_size + 1  # +1 for rtg
-            selected_reward_hs = h[0:1, group_start:group_end, :]
-            
-            # 添加奖励隐状态
-            prefix_parts.append(selected_reward_hs)
-            
-            # 奖励部分结束
-            prefix_parts.append(static['rwd_end'])
-        
         # 4. 添加动作开始标记
         prefix_parts.append(static['boa'])
         

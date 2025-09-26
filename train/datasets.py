@@ -175,7 +175,7 @@ class RewardActionDataset(Dataset):
         # 统一处理action_token_ids（stage1时可能为空）
         action_ids = []
         if action_tensors is not None and self.action_tokenizer is not None:
-            action_tensor_grouped = action_tensors.reshape(self.group, self.action_frames, -1)
+            action_tensor_grouped = action_tensors.reshape(self.group, self.action_frames, -1) # [K, action_frames, action_dim]
             action_tokens = self.action_tokenizer(action_tensor_grouped)
             last_vocab_idx = self.tokenizer.pad_token_id - 1
             action_ids = [last_vocab_idx - torch.tensor(id) for id in action_tokens]
@@ -205,7 +205,7 @@ class RewardActionDataset(Dataset):
             'states': states_k,                   # [K, state_dim]
             'reward': reward_tensor,                  # [K,action_frames, reward_dim]
             'rtg': rtg_tensor,                           # [K,action_frames, reward_dim]
-            'action_token_ids': action_ids,       #stage1为空
+            'action_token_ids': action_ids,       #stage1为空 [K, action_frames, action_dim]
         }
 
 

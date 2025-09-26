@@ -106,33 +106,15 @@ class EnvModelServer:
                         states=states
                     )
                 
-                # 优化: 仅发送关键hidden_states片段，而不是整个隐藏状态矩阵
-                # logger.info(f"[Server {self.port}] Request #{request_id}: Processing hidden states")
-                hidden_states = reward_results['hidden_states'] 
-                hidden_states_shape = hidden_states.shape 
-                context_lengths = reward_results['context_lengths'] 
-                best_reward_group = reward_results['best_reward_group'] 
-                reward_group_size = self.reward_group_size 
-                
-                # 直接使用numpy数组而非列表，减少转换开销
-                critical_segments = []
-                for i in range(len(context_lengths)):
-                    context_len_i = context_lengths[i]
-                    best_idx = best_reward_group[i].item()
-                    group_start = context_len_i + best_idx * (reward_group_size + 1)  # +1 for rtg
-                    group_end = group_start + reward_group_size + 1  # +1 for rtg
-                    critical_segment = hidden_states[i:i+1, group_start:group_end, :].cpu().to(torch.float32).numpy()
-                    critical_segments.append(critical_segment)
                 
                 # 准备要发送的二进制数据
                 # logger.info(f"[Server {self.port}] Request #{request_id}: Preparing response data")
                 serialized_results = {
                     'reward_preds_group_mean': reward_results['reward_preds_group_mean'].cpu().to(torch.float32).numpy(),
-                    'best_reward_group': best_reward_group.cpu().numpy(),
-                    'critical_segments': critical_segments,  # 只发送关键片段，已是numpy数组
-                    'hidden_states_shape': hidden_states_shape,  # 完整形状信息，用于客户端重建
-                    'context_lengths': context_lengths,
-                    'reward_group_size': reward_group_size,
+                    'best_reward_group': reward_results["best_reward_group"].cpu().numpy(),
+                    'critical_segments': reward_results["critical_segments"].cpu().to(torch.float32).numpy(),  # 只发送关键片段，已是numpy数组
+                    'context_lengths': reward_results["context_lengths"],
+                    'reward_group_size': self.reward_group_size,
                     'noise_norm': float(reward_results['noise_norm']),
                     'reward_embedding_norm': float(reward_results['reward_embedding_norm']),
                     'rwd_noise_ratio': float(reward_results['rwd_noise_ratio']),

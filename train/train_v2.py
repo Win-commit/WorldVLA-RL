@@ -173,32 +173,13 @@ class EnvModelClient:
                 
                 device = image_token_ids.device
                 dtype = torch.bfloat16
-                
-                hidden_states_shape = results['hidden_states_shape']
-                context_lengths = results['context_lengths']
-                best_reward_group = results['best_reward_group']
-                critical_segments = results['critical_segments']
-                reward_group_size = results['reward_group_size']
-                
-
-                hidden_states = torch.zeros(hidden_states_shape, dtype=torch.float32)
-                
-                for i in range(len(context_lengths)):
-                    context_len_i = context_lengths[i]
-                    best_idx = best_reward_group[i]
-                    group_start = context_len_i + best_idx * (reward_group_size + 1)
-                    group_end = group_start + reward_group_size + 1
-                    
-                    critical_segment = torch.from_numpy(critical_segments[i])
-                    hidden_states[i:i+1, group_start:group_end, :] = critical_segment
-                
-                hidden_states = hidden_states.to(device=device, dtype=dtype)
+                   
                 
                 # 构建完整结果
                 reward_results = {
                     'reward_preds_group_mean': torch.from_numpy(results['reward_preds_group_mean']).to(device=device, dtype=dtype),
                     'best_reward_group': torch.from_numpy(results['best_reward_group']).to(device=device, dtype=torch.long),
-                    'hidden_states': hidden_states,
+                    'critical_segments': torch.from_numpy(results['critical_segments']).to(device=device, dtype=dtype),
                     'context_lengths': results['context_lengths'],
                     'noise_norm': results['noise_norm'],
                     'reward_embedding_norm': results['reward_embedding_norm'],
@@ -454,7 +435,7 @@ def main():
     )
 
     actor_model.model = Emu3Model.from_pretrained(
-        "/liujinxin/zhy/UniVLA/logs/UNIVLA_LIBERO_VIDEO_BS192_8k_reproduce/checkpoint-8000",
+        "/liujinxin/zhy/UniVLA/ckpts/UniVLA/UNIVLA_LIBERO_VIDEO_BS192-8K_original",
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
         trust_remote_code=True,

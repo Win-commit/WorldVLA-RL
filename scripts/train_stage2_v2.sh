@@ -11,19 +11,19 @@ wandb login $API_KEY
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE=${1:-stage2}  
-EXP_NAME="STAGE2_TRAINER_STAGE1EMABalance_StateNorm_Actor_UNIVLA8k"
+EXP_NAME="STAGE2_EMABalance_StateNorm_Actor_UNIVLA8k_original_Videomode"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-ENV_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE1_TRAINER_Balance_Loss_StateNorm/checkpoint-200
-ACTOR_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE2_TRAINER_STAGE1EMABalance_StateNorm_warmup/checkpoint-300
+ENV_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk/checkpoint-1500
+ACTOR_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk/checkpoint-1500
 # 设置STAGE特定参数
 if [ "$STAGE" = "stage1" ]; then
     STAGE_ARGS="--stage stage1 --parallel_mode False"
     FRAMES=6
 else
-    STAGE_ARGS="--stage stage2 --parallel_mode True --parallel_reward_groups 10 --reward_group_size 10 --gamma 0.9 --noise_factor 0.4 --p 1"
-    FRAMES=1
+    STAGE_ARGS="--stage stage2 --parallel_mode True --parallel_reward_groups 10 --reward_group_size 10 --gamma 0.9 --noise_factor 0.4 "
+    FRAMES=2
 fi
 
 SERVER_PORTS=()
@@ -38,10 +38,9 @@ for GPU_ID in {0..7}; do
         --model_path $ENV_MODEL_PATH \
         --port $PORT \
         --parallel_reward_groups 10 \
-        --reward_group_size 5 \
+        --reward_group_size 10 \
         --gamma 0.9 \
         --noise_factor 0.4 \
-        --p 1.0 \
         --attn_implementation eager \
         --gpu_id $GPU_ID &
     
@@ -74,7 +73,7 @@ torchrun \
     --bf16 True \
     --tf32 True \
     --data_path ${DATAPATH} \
-    --max_steps 10000 \
+    --max_steps 20000 \
     --dataloader_num_workers 12 \
     --lr_scheduler_type "cosine_with_min_lr" \
     --warmup_steps 50 \
@@ -96,9 +95,8 @@ torchrun \
     --remove_unused_columns False \
     --dataloader_pin_memory True \
     --dataloader_drop_last True  \
-    --exp_name "STAGE2_TRAINER_STAGE1EMABalance_StateNorm_Actor_UNIVLA8k" \
-    --report_to "wandb" \
-    --resume_from_checkpoint "/liujinxin/zhy/ICLR2026/logs/STAGE2_TRAINER_STAGE1EMABalance_StateNorm_Actor_UNIVLA8k/checkpoint-7500"
+    --exp_name "STAGE2_EMABalance_StateNorm_Actor_UNIVLA8k_original_Videomode" \
+    --report_to "wandb"
 
 for PID in "${SERVER_PIDS[@]}"; do
     echo "Killing server with PID: $PID"
