@@ -451,7 +451,7 @@ def get_action(observation, task_description, model, tokenizer, image_processor,
         history_manager.add_image(image_token_ids)
         history_manager.add_state(states)
         history_manager.add_reward(rewards["critical_segments"] if rewards is not None else None)
-        history_manager.add_action(action_outputs['orig_outputs'])
+        history_manager.add_action(action_outputs['action_ids'])
         
         
         

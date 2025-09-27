@@ -774,7 +774,6 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 output_scores=False
             )
 
-        orig_outputs = outputs["sequences"][:, 1:]
         action_ids = outputs["sequences"][:, 1:-1]  # 去掉开头填充的的pad token和尾部的eoa
         
         # 处理action ids得到实际动作值
@@ -789,7 +788,6 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             actions = action_outputs[0]  # 取第一个样本的动作序列
         
         result = {
-            "orig_outputs": orig_outputs,
             'action_ids': processed_outputs,
             'actions': actions,
         }
@@ -927,6 +925,9 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 prefix_parts += [static['rwd_beg']]
                 prefix_parts += [history["reward"][history_time].squeeze(1)]
                 prefix_parts += [static['rwd_end']]
+                prefix_parts += [static['boa']]
+                prefix_parts += [history["action_ids"][history_time]]
+                prefix_parts += [static['eoa']]
 
         # 2. 图像和状态部分
         K = image_token_ids.shape[1]  # 图像数量
