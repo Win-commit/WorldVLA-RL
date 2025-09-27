@@ -118,6 +118,7 @@ class EvaluationConfig:
     num_trials_per_task: int = 50
     initial_states_path: str = "DEFAULT"
     env_img_res: int = 256
+    window_size: int = 2 #0就退化成了不加任何历史
     
     # 工具参数
     run_id_note: Optional[str] = None
@@ -127,6 +128,7 @@ class EvaluationConfig:
     wandb_entity: str = ""
     wandb_project: str = ""
     seed: int = 7
+    
 
 def setup_logging(cfg: EvaluationConfig):
     """设置日志记录"""
@@ -153,6 +155,48 @@ def setup_logging(cfg: EvaluationConfig):
     
     return log_file, local_log_filepath, run_id
 
+class HistoryManager:
+    """管理图像和动作的历史记录"""
+    def __init__(self, window_size=2):
+        self.window_size = window_size
+        self.vision_queue = deque(maxlen=self.window_size) # save gripper and main view image in a window
+        self.state_queue = deque(maxlen=self.window_size) # save state in a window
+        self.reward_queue = deque(maxlen=self.window_size) # save reward in a window
+        self.action_queue = deque(maxlen=self.window_size - 1) # save action in a window
+    
+    def add_image(self, image_inputs):
+        """添加图像到历史队列"""
+        self.vision_queue.append(image_inputs)
+    
+    def add_state(self, state):
+        """添加状态到历史队列"""
+        self.state_queue.append(state)
+    
+    def add_reward(self, reward):
+        """添加奖励到历史队列"""
+        self.reward_queue.append(reward)
+
+    def get_history(self):
+        """获取历史图像"""
+        return {
+            "vision": list(self.vision_queue),
+            "state": list(self.state_queue),
+            "reward": list(self.reward_queue),
+            "action": list(self.action_queue)   
+        }
+    
+    def add_action(self, action):
+        """添加动作到历史队列"""
+        self.action_queue.append(action)
+    
+    
+    def reset(self):
+        """重置历史队列"""
+        self.vision_queue.clear()
+        self.action_queue.clear()
+
+
+
 def get_libero_env(task, resolution=256):
     """初始化并返回LIBERO环境"""
     task_description = task.language
@@ -161,6 +205,7 @@ def get_libero_env(task, resolution=256):
     env = OffScreenRenderEnv(**env_args)
     env.seed(0)  
     return env, task_description
+
 
 def save_rollout_video(rollout_images, idx, success, task_description, log_file=None, output_dir=None):
     """保存一个episode的MP4回放"""
@@ -306,31 +351,31 @@ def unormalize_action(action):
     action = 0.5 * (action + 1) * (action_high - action_low) + action_low
     return action
 
-def test_reward(reward_sampling_results,env_model):
-    h = reward_sampling_results['hidden_states']
-    context_len_i = reward_sampling_results['context_lengths'][0]
-    best_idx = reward_sampling_results['best_reward_group'][0].item()
-    group_start = context_len_i + best_idx * (5 + 1)
-    group_end = group_start + 5 + 1
-    selected_reward_hs = h[0:1, group_start:group_end, :]  # [1, G+1, H]
+# def test_reward(reward_sampling_results,env_model):
+#     h = reward_sampling_results['hidden_states']
+#     context_len_i = reward_sampling_results['context_lengths'][0]
+#     best_idx = reward_sampling_results['best_reward_group'][0].item()
+#     group_start = context_len_i + best_idx * (5 + 1)
+#     group_end = group_start + 5 + 1
+#     selected_reward_hs = h[0:1, group_start:group_end, :]  # [1, G+1, H]
     
-    # 提取前5个向量 [5, H]
-    vectors = selected_reward_hs[0:1, :5, :]
-    rwd_hat = env_model.reward_head(vectors).squeeze(0)
-    rtg = env_model.rtg_head(selected_reward_hs[0:1, -1, :]).squeeze(0)
-    # 计算前5个向量的方差
-    variance = torch.var(rwd_hat, dim=0)  # 各维度的方差 [H]
-    total_variance = torch.sum(variance).item()  
+#     # 提取前5个向量 [5, H]
+#     vectors = selected_reward_hs[0:1, :5, :]
+#     rwd_hat = env_model.reward_head(vectors).squeeze(0)
+#     rtg = env_model.rtg_head(selected_reward_hs[0:1, -1, :]).squeeze(0)
+#     # 计算前5个向量的方差
+#     variance = torch.var(rwd_hat, dim=0)  # 各维度的方差 [H]
+#     total_variance = torch.sum(variance).item()  
     
-    # 还可以计算平均方差作为标准化指标
-    avg_variance = total_variance / rwd_hat.shape[1]
+#     # 还可以计算平均方差作为标准化指标
+#     avg_variance = total_variance / rwd_hat.shape[1]
     
-    return {
-        "total_variance": total_variance,
-        "avg_variance": avg_variance,
-        "reward_hat": rwd_hat,
-        "rtg": rtg,
-    }
+#     return {
+#         "total_variance": total_variance,
+#         "avg_variance": avg_variance,
+#         "reward_hat": rwd_hat,
+#         "rtg": rtg,
+#     }
 
 def image_level_enc_dec(images, image_tokenizer, image_processor, visual_token_pattern: str = "<|visual token {token_id:0>6d}|>"):
     """批量处理图像：编码并保存代码"""
@@ -346,7 +391,7 @@ def image_level_enc_dec(images, image_tokenizer, image_processor, visual_token_p
         except Exception as e:
             print(f"处理起始于图像 {start_idx} 的批次时出错: {e}")
 
-def get_action(observation, task_description, model, tokenizer, image_processor, image_tokenizer, processor, action_tokenizer, visual_token_pattern="<|visual token {token_id:0>6d}|>", env_model = None, log_file = None):
+def get_action(observation, task_description, model, tokenizer, image_processor, image_tokenizer, processor, action_tokenizer, visual_token_pattern="<|visual token {token_id:0>6d}|>", env_model = None, log_file = None, history_manager = None):
     """使用模型获取动作"""
     # 编码图像
     video_code = image_level_enc_dec([observation["full_image"]], image_tokenizer=image_tokenizer, image_processor=image_processor, visual_token_pattern=visual_token_pattern)
@@ -363,6 +408,7 @@ def get_action(observation, task_description, model, tokenizer, image_processor,
     # 使用tokenizer将格式化的提示转换为token ids
     image_token_ids = tokenizer(merged_prompt, padding=False, return_token_type_ids=False, return_tensors="pt")["input_ids"].to(device)
     image_token_ids = image_token_ids.unsqueeze(0)  # [1, 1, L_img]
+        
     # 准备文本输入
     text_prompt = tokenizer.bos_token + task_description
     text_ids = tokenizer(text_prompt, padding=False, return_token_type_ids=False, return_tensors="pt")["input_ids"].to(device)
@@ -370,9 +416,10 @@ def get_action(observation, task_description, model, tokenizer, image_processor,
     
     # 准备状态输入
     robot_state = observation["robot_state"] #[8,]
+
     
     # 转换为tensor
-    states = torch.tensor(robot_state, dtype=torch.bfloat16, device=device).unsqueeze(0).unsqueeze(0)
+    states = torch.tensor(robot_state, dtype=torch.bfloat16, device=device).unsqueeze(0).unsqueeze(0) #[1,1,8]
     
     # 使用模型进行推理
     with torch.no_grad():
@@ -382,11 +429,8 @@ def get_action(observation, task_description, model, tokenizer, image_processor,
                 text_ids_list=text_ids_list,
                 image_token_ids=image_token_ids,
                 states=states,
+                history = history_manager.get_history() if history_manager is not None else None
             )
-        #==========================验证一下猜想=================================
-        test = test_reward(rewards,env_model)
-        log_message(f"test: {test}", log_file)
-        #=======================================================================
 
         action_outputs = model.generate_actions_inference(
             text_ids_list=text_ids_list,
@@ -399,9 +443,18 @@ def get_action(observation, task_description, model, tokenizer, image_processor,
             action_dim=7,
             time_horizon=NUM_ACTIONS_CHUNK,
             do_sample=False,
-            auto_sample_reward=True
+            auto_sample_reward=True,
+            history = history_manager.get_history() if history_manager is not None else None
         )
     
+    if history_manager is not None:
+        history_manager.add_image(image_token_ids)
+        history_manager.add_state(states)
+        history_manager.add_reward(rewards["critical_segments"] if rewards is not None else None)
+        history_manager.add_action(action_outputs['orig_outputs'])
+        
+        
+        
     # 处理动作输出
     actions = action_outputs['actions']
     
@@ -437,7 +490,7 @@ def run_episode(
     """在环境中运行单个episode"""
     # 重置环境
     env.reset()
-    
+    history_manager = HistoryManager(window_size=cfg.window_size)
     # 设置初始状态（如果提供）
     if initial_state is not None:
         obs = env.set_init_state(initial_state)
@@ -482,7 +535,8 @@ def run_episode(
                 action_tokenizer,
                 cfg.visual_token_pattern,
                 env_model,
-                log_file
+                log_file,
+                history_manager
             )
             action_queue.extend(actions)
         

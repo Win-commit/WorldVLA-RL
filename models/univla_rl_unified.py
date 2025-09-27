@@ -379,7 +379,13 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             t_emb = self.get_input_embeddings()(text_ids.unsqueeze(0))  # [1,L_text,H]
             parts = [t_emb]
             if history is not None:
-                pass # TODO: add history
+                for history_time in range(len(history["vision"])):
+                    parts += self.get_input_embeddings()(history["vision"][history_time].squeeze(1))
+                    parts += [static['state_beg'], self.proprio(history["states"][history_time]), static['state_end']]
+                    parts += [static['rwd_beg']]
+                    parts += [history["reward"][history_time].squeeze(1)]
+                    parts += [static['rwd_end']]
+
             # per-frame segments (assuming K=1 for parallel reward sampling)
             for j in range(K):
                 # image
@@ -546,7 +552,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             'reward_embedding_norm': reward_scale,
             'noise_norm': avg_noise_norm,
             'rwd_noise_ratio': rwd_noise_ratio,
-            'rtg_noise_ratio': rtg_noise_ratio
+            'rtg_noise_ratio': rtg_noise_ratio,
         }
 
 
@@ -617,7 +623,9 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                     if self.detach_selected_reward_hs:
                         selected_reward_hs = selected_reward_hs.detach()
                     parts2.append(selected_reward_hs)
+
                     assert self.reward_group_size + 1 == selected_reward_hs.size(1), f"reward_group_size: {self.reward_group_size}, selected_reward_hs.size(1): {selected_reward_hs.size(1)}"
+                    
                     labels2 += [-100] * (self.reward_group_size + 1)  # reward + rtg部分不计算loss
                     parts2.append(static['rwd_end'])
                     labels2 += [-100]
@@ -766,9 +774,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 output_scores=False
             )
 
-        # 只取新生成的部分（去掉前缀）
-        prefix_len = prefix_inputs['inputs_embeds'].shape[1]
-        action_ids = outputs["sequences"][:, 1:-1]  # 去掉首尾的填充和eos
+        orig_outputs = outputs["sequences"][:, 1:]
+        action_ids = outputs["sequences"][:, 1:-1]  # 去掉开头填充的的pad token和尾部的eoa
         
         # 处理action ids得到实际动作值
         last_token_id_tensor = torch.tensor(last_token_id, dtype=action_ids.dtype, device=device)
@@ -782,6 +789,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             actions = action_outputs[0]  # 取第一个样本的动作序列
         
         result = {
+            "orig_outputs": orig_outputs,
             'action_ids': processed_outputs,
             'actions': actions,
         }
@@ -913,7 +921,12 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         prefix_parts.append(t_emb)
 
         if history is not None:
-            pass # TODO: add history
+            for history_time in range(len(history["vision"])):
+                prefix_parts += self.get_input_embeddings()(history["vision"][history_time].squeeze(1))
+                prefix_parts += [static['state_beg'], self.proprio(history["states"][history_time]), static['state_end']]
+                prefix_parts += [static['rwd_beg']]
+                prefix_parts += [history["reward"][history_time].squeeze(1)]
+                prefix_parts += [static['rwd_end']]
 
         # 2. 图像和状态部分
         K = image_token_ids.shape[1]  # 图像数量
