@@ -1,5 +1,5 @@
 import os
-os.environ["MUJOCO_GL"] = "egl"
+# os.environ["MUJOCO_GL"] = "egl"
 import torch
 import pickle
 import numpy as np
@@ -107,7 +107,7 @@ class EvaluationConfig:
     vision_hub: str = "/liujinxin/zhy/ICLR2026/pretrain/Emu3-VisionTokenizer"
     fast_path: str = "/liujinxin/zhy/ICLR2026/pretrain/fast"
     parallel_mode: bool = True
-    parallel_reward_groups: int = 5
+    parallel_reward_groups: int = 10
     reward_group_size: int = 10
     num_open_loop_steps: int = 10
     visual_token_pattern: str = "<|visual token {token_id:0>6d}|>"
@@ -118,7 +118,7 @@ class EvaluationConfig:
     num_trials_per_task: int = 50
     initial_states_path: str = "DEFAULT"
     env_img_res: int = 256
-    window_size: int = 2 #0就退化成了不加任何历史
+    window_size: int = 1 #0就退化成了不加任何历史
     
     # 工具参数
     run_id_note: Optional[str] = None
@@ -162,7 +162,7 @@ class HistoryManager:
         self.vision_queue = deque(maxlen=self.window_size) # save gripper and main view image in a window
         self.state_queue = deque(maxlen=self.window_size) # save state in a window
         self.reward_queue = deque(maxlen=self.window_size) # save reward in a window
-        self.action_queue = deque(maxlen=self.window_size - 1) # save action in a window
+        self.action_queue = deque(maxlen=self.window_size) # save action in a window
     
     def add_image(self, image_inputs):
         """添加图像到历史队列"""
@@ -431,7 +431,6 @@ def get_action(observation, task_description, model, tokenizer, image_processor,
                 states=states,
                 history = history_manager.get_history() if history_manager is not None else None
             )
-
         action_outputs = model.generate_actions_inference(
             text_ids_list=text_ids_list,
             image_token_ids=image_token_ids,
@@ -782,7 +781,7 @@ if __name__ == "__main__":
     cfg.parallel_reward_groups = args.parallel_reward_groups
     cfg.reward_group_size = args.reward_group_size
     cfg.num_trials_per_task = args.trials
-    cfg.save_videos = False
+    cfg.save_videos = True
     cfg.visual_token_pattern = args.visual_token_pattern
     cfg.local_log_dir = args.local_log_dir
     # 设置任务套件

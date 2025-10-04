@@ -1,6 +1,6 @@
 from torch import nn
 import torch
-
+import torch.nn.functional as F
 
 class MLPResNetBlock(nn.Module):
     """One MLP ResNet block with a residual connection."""
@@ -47,37 +47,103 @@ class MLPResNet(nn.Module):
         return x
 
 
-class RwdHead(nn.Module):
-    def __init__(
-        self,
-        input_dim=4096,
-        hidden_dim=4096,
-        Rwd_dim=14,
-    ):
+class ValueEncoder(nn.Module):
+    def __init__(self, input_dim=14, condition_dim=4096, latent_dim=14):
         super().__init__()
-        self.action_dim = Rwd_dim
-        self.model = MLPResNet(
-            num_blocks=2, input_dim=input_dim, hidden_dim=hidden_dim, output_dim=Rwd_dim
+        current_dim = input_dim + condition_dim  
+
+        self.fc1 = nn.Sequential(
+            nn.LayerNorm(current_dim),
+            nn.Linear(current_dim, 1024),
+            nn.ReLU()
         )
-
-    def forward(self, rwd_hidden_states):
-        #rwd_hidden_states: [1,hidden_dim]
-        return self.model(rwd_hidden_states)
-
-class RtgHead(nn.Module):
-    def __init__(
-        self,
-        input_dim=4096,
-        hidden_dim=4096,
-        Rtg_dim=14,
-    ):
-        super().__init__()
-        self.action_dim = Rtg_dim
         self.model = MLPResNet(
-            num_blocks=2, input_dim=input_dim, hidden_dim=hidden_dim, output_dim=Rtg_dim
+            num_blocks=2, 
+            input_dim=1024, 
+            hidden_dim=512,
+            output_dim=256
         )
-
-    def forward(self, rtg_hidden_states):
-        #rtg_hidden_states: [1,hidden_dim]
-        return self.model(rtg_hidden_states)
+        self.mu = nn.Linear(256, latent_dim)
+        self.log_var = nn.Linear(256, latent_dim)
         
+    def forward(self, rwd_hidden_states, rwd):
+        # rwd_hidden_states(c): [batch, 4096], rwd: [batch, 14]
+        x_cond = torch.cat([rwd_hidden_states, rwd], dim=-1)  # [batch, 4110]
+        x = self.fc1(x_cond)        # [batch, 1024]
+        features = self.model(x)     # [batch, 256]
+        mu = self.mu(features)       # [batch, 14]
+        log_var = self.log_var(features)  # [batch, 14]
+        return mu, log_var
+
+
+class ValueDecoder(nn.Module):
+    def __init__(
+        self,
+        latent_dim=14,
+        condition_dim=4096,
+        output_dim=14,
+    ):
+        super().__init__()
+        current_dim = latent_dim + condition_dim  # 4110
+        
+        # 渐进式上采样（与 Encoder 对称）：4110 -> 1024 -> 512 -> 256 -> 14
+        self.fc1 = nn.Sequential(
+            nn.LayerNorm(current_dim),
+            nn.Linear(current_dim, 1024),
+            nn.ReLU()
+        )
+        self.model = MLPResNet(
+            num_blocks=2,
+            input_dim=1024,
+            hidden_dim=512,
+            output_dim=256
+        )
+        self.fc_out = nn.Linear(256, output_dim)
+
+    def forward(self, rwd_hidden_states, latent_vectors):
+        x = torch.cat([rwd_hidden_states, latent_vectors], dim=-1)  # [batch, 4110]
+        x = self.fc1(x)                 # [batch, 1024]
+        x = self.model(x)                 # [batch, 256]
+        output = self.fc_out(x)           # [batch, 14]
+        return output
+
+
+def vae_loss(recon_x, x, mu, log_var, recon_weight=1.0, kl_weight=1.0):
+    """
+    条件VAE的损失函数
+    
+    Args:
+        recon_x: 重建的输出
+        x: 原始输入
+        mu: 潜变量的均值
+        log_var: 潜变量的对数方差
+        recon_weight: 重建损失的权重
+        kl_weight: KL散度的权重
+    """
+
+    recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+    
+    # 2. KL散度损失 (KL Divergence)
+    # KL(q(z|x) || p(z))，其中p(z)是标准正态分布
+    kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+    
+    # 3. 总损失
+    total_loss = recon_weight * recon_loss + kl_weight * kl_loss
+    
+    return {
+        'total_loss': total_loss,
+        'recon_loss': recon_loss,
+        'kl_loss': kl_loss
+    }
+
+def reparameterize(mu, log_var):
+    """
+    Reparameterization trick to sample from a Gaussian distribution.
+    
+    Args:
+        mu: mean of the Gaussian distribution
+        log_var: log of the variance of the Gaussian distribution
+    """
+    std = torch.exp(0.5 * log_var)
+    eps = torch.randn_like(std)
+    return mu + eps * std

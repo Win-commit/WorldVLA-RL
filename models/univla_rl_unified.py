@@ -15,7 +15,7 @@ from torch.cuda.amp import autocast
 # 添加分布式训练相关导入
 import torch.distributed as dist
 
-from models.reward_heads import RwdHead, RtgHead
+from models.reward_heads import ValueEncoder, ValueDecoder, reparameterize, vae_loss
 from models.Emu3.emu3.mllm.modeling_emu3 import Emu3PreTrainedModel, Emu3Model
 from models.Emu3.emu3.mllm.tokenization_emu3 import Emu3Tokenizer
 from PIL import Image
@@ -74,10 +74,12 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         self.detach_selected_reward_hs = detach_selected_reward_hs
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.reward_head = RwdHead()
-        self.rtg_head = RtgHead()
+        self.reward_encoder = ValueEncoder()
+        self.rtg_encoder = ValueEncoder()
+        self.reward_decoder = ValueDecoder()
+        self.rtg_decoder = ValueDecoder()
         # 自动平衡Stage1损失
-        self.auto_balance_stage1 = True
+        self.auto_balance_stage1 = False
         self.loss_ema_decay = 0.99
         self.register_buffer('img_ce_ema', torch.tensor(1.0), persistent=False)
         self.register_buffer('rwd_mse_ema', torch.tensor(1.0), persistent=False)
@@ -253,18 +255,24 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
 
         reward_vectors = h[batch_indices, reward_pos_indices] # [B*K*action_frames, hidden_dim]
         rtg_vectors = h[batch_indices, rtg_pos_indices] # [B*K*action_frames, hidden_dim]
-
-        reward_preds = self.reward_head(reward_vectors).view(B, K*action_frames, -1)
-        rtg_preds = self.rtg_head(rtg_vectors).view(B, K*action_frames, -1)
-        
         rwd_mse = 0
         rtg_mse = 0
-        if reward_targets is not None:
-            reward_targets =  reward_targets.contiguous().view(B, K * action_frames, -1)
-            rwd_mse += F.mse_loss(reward_preds, reward_targets)
-        if rtg_targets is not None:
-            rtg_targets = rtg_targets.contiguous().view(B, K * action_frames, -1)
-            rtg_mse += F.mse_loss(rtg_preds, rtg_targets)
+
+        if reward_targets is not None and rtg_targets is not None:
+            reward_targets_reshape = reward_targets.reshape(B*K*action_frames, -1)
+            rtg_targets_reshape = rtg_targets.reshape(B*K*action_frames, -1)
+            #Contional-VAE Encode:
+            reward_mu, reward_log_var = self.reward_encoder(reward_vectors, reward_targets_reshape)
+            rtg_mu, rtg_log_var = self.rtg_encoder(rtg_vectors, rtg_targets_reshape)
+            z_reward = reparameterize(reward_mu, reward_log_var)
+            z_rtg = reparameterize(rtg_mu, rtg_log_var)
+            #Contional-VAE Decode:
+            reward_preds = self.reward_decoder(reward_vectors, z_reward)
+            rtg_preds = self.rtg_decoder(rtg_vectors, z_rtg)
+
+            rwd_mse += vae_loss(reward_preds, reward_targets_reshape, reward_mu, reward_log_var)['total_loss']
+            rtg_mse += vae_loss(rtg_preds, rtg_targets_reshape, rtg_mu, rtg_log_var)['total_loss']
+        
         # 使用EMA对不同尺度的损失进行自适应加权
         if self.auto_balance_stage1:
             eps = 1e-8
@@ -283,7 +291,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 rtg_w = torch.clamp(self.img_ce_ema.detach() / (self.rtg_mse_ema.detach() + eps), 0.1, 10.0)
                 total_loss = total_loss + rtg_w * rtg_mse
         else:
-            total_loss = img_ce + rwd_mse + rtg_mse
+            total_loss = (0.005 * img_ce) + rwd_mse + rtg_mse
         
         avg_noise_norm = sum(noise_norms) / len(noise_norms)
         rwd_noise_ratio = avg_noise_norm / torch.norm(static['rwd']).item()
@@ -378,13 +386,17 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             # text embeddings and initial labels
             t_emb = self.get_input_embeddings()(text_ids.unsqueeze(0))  # [1,L_text,H]
             parts = [t_emb]
+            history_length = 0
             if history is not None:
                 for history_time in range(len(history["vision"])):
-                    parts += self.get_input_embeddings()(history["vision"][history_time].squeeze(1))
-                    parts += [static['state_beg'], self.proprio(history["states"][history_time]), static['state_end']]
+                    parts += self.get_input_embeddings()(history["vision"][history_time])
+                    history_length += history["vision"][history_time].shape[-1]
+                    parts += [static['state_beg'], self.proprio(history["state"][history_time]), static['state_end']]
+                    history_length += 1 + 1 + 1
                     parts += [static['rwd_beg']]
                     parts += [history["reward"][history_time].squeeze(1)]
                     parts += [static['rwd_end']]
+                    history_length += 1 + history["reward"][history_time].squeeze(1).shape[1] + 1
 
             # per-frame segments (assuming K=1 for parallel reward sampling)
             for j in range(K):
@@ -399,7 +411,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 # Each group now has reward_group_size + 1 tokens (including rtg)
                 context_len = L_text + (L_img + 3) + 1  # 3 for state_beg, state, state_end, 1 for rwd_beg
                 if history is not None:
-                    context_len += 0 # TODO: add history length
+                    context_len += history_length 
                 if context_length_ind == []:
                     context_length_ind.append(context_len)
                 else:
@@ -516,8 +528,10 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         reward_vectors = h[batch_indices, reward_pos_indices] # [B*K*M*10, hidden_dim]
         rtg_vectors = h[batch_indices, rtg_pos_indices] # [B*K*M*10, hidden_dim]
         
-        reward_preds = self.reward_head(reward_vectors).view(B, K, self.parallel_reward_groups, 10, -1) # [B,K,M,10,14]
-        rtg_preds = self.rtg_head(rtg_vectors).view(B, K, self.parallel_reward_groups, 10, -1) # [B,K,M,10,14]
+        #Value decode
+        z_latent = torch.randn(B*K*self.parallel_reward_groups*10, self.latent_dim).to(device)
+        reward_preds = self.reward_decoder(reward_vectors, z_latent).view(B, K, self.parallel_reward_groups, 10, -1) # [B,K,M,10,14]
+        rtg_preds = self.rtg_decoder(rtg_vectors, z_latent).view(B, K, self.parallel_reward_groups, 10, -1) # [B,K,M,10,14]
 
         best_group_indices = self.select_best_reward_groups(reward_preds, rtg_preds)
             
@@ -531,21 +545,34 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         
         #方便后续使用，直接把需要的reward和rtg返回
         critical_segments = []
+        selected_values = []  # 存储解码后的 reward 和 rtg
         for i in range(B):
             for k in range(K):
                 best_idx = best_group_indices[i, k].item()
                 group_start = context_lengths[i][k] + best_idx * (20)
+                # 收集 hidden states
                 for token_idx in range(self.reward_group_size):
                     critical_segments.append(h[i:i+1, group_start+token_idx*2, :])
                 critical_segments.append(h[i:i+1, group_start + self.reward_group_size*2 - 1, :])
+                
+                # 收集对应的解码值：前 reward_group_size 个来自 reward_preds，最后1个来自 rtg_preds
+                # reward_preds[i, k, best_idx]: [10, 14]
+                for token_idx in range(self.reward_group_size):
+                    selected_values.append(reward_preds[i, k, best_idx, token_idx, :])  # [14]
+                selected_values.append(rtg_preds[i, k, best_idx, self.reward_group_size, :])  # [14]
+                
         critical_segments = torch.cat(critical_segments, dim=0)  # [B*K*(S+1), dim]
         critical_segments = critical_segments.view(B, K, self.reward_group_size + 1, -1)
+        
+        selected_values = torch.stack(selected_values, dim=0)  # [B*K*(S+1), 14]
+        selected_values = selected_values.view(B, K, self.reward_group_size + 1, -1)  # [B, K, S+1, 14]
         
         # 返回奖励采样结果和模型状态
         return {
             'logits': logits,
             'reward_preds_group_mean': torch.mean(reward_preds[..., -1], dim=-1),
             'best_reward_group': best_group_indices, # [B,K]
+            'selected_values': selected_values, # [B,K,reward_group_size+1,14]
             'hidden_states': h, # [B,max_len,H]
             'critical_segments': critical_segments, # [B,K,S+1,H]
             'context_lengths': context_lengths, # [B,K]
@@ -730,9 +757,6 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 states=states
             )
         
-        # 检查reward_sampling_results的有效性（如果有）
-        if reward_sampling_results is not None:
-            raise ValueError("Invalid reward_sampling_results provided")
         
         # 构建前缀序列
         prefix_inputs = self._prepare_action_prefix(text_ids_list, image_token_ids, states, reward_sampling_results, history)
@@ -920,13 +944,13 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
 
         if history is not None:
             for history_time in range(len(history["vision"])):
-                prefix_parts += self.get_input_embeddings()(history["vision"][history_time].squeeze(1))
-                prefix_parts += [static['state_beg'], self.proprio(history["states"][history_time]), static['state_end']]
+                prefix_parts += self.get_input_embeddings()(history["vision"][history_time])
+                prefix_parts += [static['state_beg'], self.proprio(history["state"][history_time]), static['state_end']]
                 prefix_parts += [static['rwd_beg']]
                 prefix_parts += [history["reward"][history_time].squeeze(1)]
                 prefix_parts += [static['rwd_end']]
                 prefix_parts += [static['boa']]
-                prefix_parts += [history["action_ids"][history_time]]
+                prefix_parts += self.get_input_embeddings()(history["action"][history_time]).unsqueeze(1)
                 prefix_parts += [static['eoa']]
 
         # 2. 图像和状态部分

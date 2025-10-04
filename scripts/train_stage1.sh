@@ -11,7 +11,7 @@ NGPUS=8
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE="stage1"  
-EXP_NAME="STAGE1_BalanceLoss_StateNorm_ValueChunk"
+EXP_NAME="STAGE1_BalanceLoss_StateNorm_ValueChunk_lamda0.005"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -61,4 +61,4 @@ torchrun \
     --remove_unused_columns False \
     --dataloader_pin_memory True \
     --dataloader_drop_last True \
-    --exp_name "STAGE1_BalanceLoss_StateNorm_ValueChunk" 
+    --exp_name $EXP_NAME 
