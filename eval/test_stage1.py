@@ -136,10 +136,10 @@ def visualize_rewards_comparison(pred_rewards, real_rewards, reward_names, save_
 
 
 if __name__ == "__main__":
-    env_model_path = "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_lamda0.005/checkpoint-4600"
+    env_model_path = "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-1500"
     data_path = "/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm.pkl"
-    history_manager = HistoryManager(window_size=1)
-    save_dir = "reward_visualizations-4600_v4"
+    history_manager = HistoryManager(window_size=2)
+    save_dir = "reward_visualizations-1500"
     action_frames = 10
     reward_group_size = 10
     tokenizer = Emu3Tokenizer.from_pretrained(
