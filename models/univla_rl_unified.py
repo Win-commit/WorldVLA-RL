@@ -79,7 +79,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         self.reward_decoder = ValueDecoder()
         self.rtg_decoder = ValueDecoder()
         # 自动平衡Stage1损失
-        self.auto_balance_stage1 = False
+        self.auto_balance_stage1 = True
         self.loss_ema_decay = 0.99
         self.register_buffer('img_ce_ema', torch.tensor(1.0), persistent=False)
         self.register_buffer('rwd_mse_ema', torch.tensor(1.0), persistent=False)
@@ -276,13 +276,12 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         # 使用EMA对不同尺度的损失进行自适应加权
         if self.auto_balance_stage1:
             eps = 1e-8
-            if self.training:
-                with torch.no_grad():
-                    self.img_ce_ema = self.img_ce_ema * self.loss_ema_decay + (1 - self.loss_ema_decay) * img_ce.detach()
-                    if reward_targets is not None:
-                        self.rwd_mse_ema = self.rwd_mse_ema * self.loss_ema_decay + (1 - self.loss_ema_decay) * rwd_mse.detach()
-                    if rtg_targets is not None:
-                        self.rtg_mse_ema = self.rtg_mse_ema * self.loss_ema_decay + (1 - self.loss_ema_decay) * rtg_mse.detach()
+            with torch.no_grad():
+                self.img_ce_ema = self.img_ce_ema * self.loss_ema_decay + (1 - self.loss_ema_decay) * img_ce.detach()
+                if reward_targets is not None:
+                    self.rwd_mse_ema = self.rwd_mse_ema * self.loss_ema_decay + (1 - self.loss_ema_decay) * rwd_mse.detach()
+                if rtg_targets is not None:
+                    self.rtg_mse_ema = self.rtg_mse_ema * self.loss_ema_decay + (1 - self.loss_ema_decay) * rtg_mse.detach()
             total_loss = img_ce
             if reward_targets is not None:
                 rwd_w = torch.clamp(self.img_ce_ema.detach() / (self.rwd_mse_ema.detach() + eps), 0.1, 10.0)
@@ -309,8 +308,9 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 'rwd_noise_ratio': rwd_noise_ratio,
                 'rtg_noise_ratio': rtg_noise_ratio,
                 'logits': logits,
-                'reward_preds': reward_preds,
-                'rtg_pred': rtg_preds}
+                'reward_preds': None,
+                'rtg_pred': None,
+                }
 
     def select_best_reward_groups(self, reward_preds, rtg_preds):
         """        
@@ -506,9 +506,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         reward_pos = []
         rtg_pos = []
         for i, text_ids in enumerate(text_ids_list):
-            
             # Parallel reward sampling: predict from all reward groups
-            sample_reward_preds = []
             for k in range(K):
                 for group_idx in range(self.parallel_reward_groups):
                     group_start_pos = context_lengths[i][k] + group_idx * (20)   
@@ -529,7 +527,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         rtg_vectors = h[batch_indices, rtg_pos_indices] # [B*K*M*10, hidden_dim]
         
         #Value decode
-        z_latent = torch.randn(B*K*self.parallel_reward_groups*10, self.latent_dim).to(device)
+        z_latent = torch.randn(B*K*self.parallel_reward_groups*10, 14, dtype=reward_vectors.dtype, device=device)
         reward_preds = self.reward_decoder(reward_vectors, z_latent).view(B, K, self.parallel_reward_groups, 10, -1) # [B,K,M,10,14]
         rtg_preds = self.rtg_decoder(rtg_vectors, z_latent).view(B, K, self.parallel_reward_groups, 10, -1) # [B,K,M,10,14]
 
@@ -559,7 +557,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 # reward_preds[i, k, best_idx]: [10, 14]
                 for token_idx in range(self.reward_group_size):
                     selected_values.append(reward_preds[i, k, best_idx, token_idx, :])  # [14]
-                selected_values.append(rtg_preds[i, k, best_idx, self.reward_group_size, :])  # [14]
+                selected_values.append(rtg_preds[i, k, best_idx, self.reward_group_size - 1, :])  # [14]
                 
         critical_segments = torch.cat(critical_segments, dim=0)  # [B*K*(S+1), dim]
         critical_segments = critical_segments.view(B, K, self.reward_group_size + 1, -1)

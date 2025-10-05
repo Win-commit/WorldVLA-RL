@@ -108,7 +108,7 @@ class ValueDecoder(nn.Module):
         return output
 
 
-def vae_loss(recon_x, x, mu, log_var, recon_weight=1.0, kl_weight=1.0):
+def vae_loss(recon_x, x, mu, log_var, recon_weight=1.0, kl_weight=1.0, beta=0.1):
     """
     条件VAE的损失函数
     
@@ -121,7 +121,7 @@ def vae_loss(recon_x, x, mu, log_var, recon_weight=1.0, kl_weight=1.0):
         kl_weight: KL散度的权重
     """
 
-    recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+    recon_loss = F.smooth_l1_loss(recon_x, x, reduction='sum', beta=beta)
     
     # 2. KL散度损失 (KL Divergence)
     # KL(q(z|x) || p(z))，其中p(z)是标准正态分布

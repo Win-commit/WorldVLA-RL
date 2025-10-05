@@ -11,7 +11,7 @@ NGPUS=8
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE="stage1"  
-EXP_NAME="STAGE1_BalanceLoss_StateNorm_ValueChunk_lamda0.005"
+EXP_NAME="STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -28,10 +28,10 @@ torchrun \
     ${STAGE_ARGS} \
     --deepspeed configs/deepspeed/zero3_offload.json \
     --output_dir "logs/"${EXP_NAME} \
-    --learning_rate 8e-5 \
+    --learning_rate 5e-5 \
     --weight_decay 0.1 \
     --min_learning_rate 5e-6 \
-    --max_grad_norm 5.0 \
+    --max_grad_norm 50.0 \
     --adam_beta1 0.9 \
     --adam_beta2 0.95 \
     --adam_epsilon 1e-6 \
@@ -54,7 +54,7 @@ torchrun \
     --logging_steps 4 \
     --gradient_checkpointing True \
     --gradient_accumulation_steps 6 \
-    --save_steps 100 \
+    --save_steps 500 \
     --save_strategy "steps" \
     --evaluation_strategy "no" \
     --run_name "unified_${STAGE}_training_$(date +%Y%m%d_%H%M%S)" \
