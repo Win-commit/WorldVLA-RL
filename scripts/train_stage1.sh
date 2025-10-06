@@ -11,7 +11,7 @@ NGPUS=8
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE="stage1"  
-EXP_NAME="STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA"
+EXP_NAME="STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA_MSE"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 

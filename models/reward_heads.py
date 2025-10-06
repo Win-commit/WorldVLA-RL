@@ -121,8 +121,9 @@ def vae_loss(recon_x, x, mu, log_var, recon_weight=1.0, kl_weight=1.0, beta=0.1)
         kl_weight: KL散度的权重
     """
 
-    recon_loss = F.smooth_l1_loss(recon_x, x, reduction='sum', beta=beta)
-    
+    # recon_loss = F.smooth_l1_loss(recon_x, x, reduction='sum', beta=beta)
+    #做个对比实验看看
+    recon_loss = F.mse_loss(recon_x, x, reduction='sum')
     # 2. KL散度损失 (KL Divergence)
     # KL(q(z|x) || p(z))，其中p(z)是标准正态分布
     kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())

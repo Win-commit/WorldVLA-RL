@@ -136,10 +136,10 @@ def visualize_rewards_comparison(pred_rewards, real_rewards, reward_names, save_
 
 
 if __name__ == "__main__":
-    env_model_path = "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-1500"
+    env_model_path = "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-500"
     data_path = "/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm.pkl"
     history_manager = HistoryManager(window_size=2)
-    save_dir = "reward_visualizations-1500"
+    save_dir = "reward_visualizations-500"
     action_frames = 10
     reward_group_size = 10
     tokenizer = Emu3Tokenizer.from_pretrained(
@@ -221,7 +221,7 @@ if __name__ == "__main__":
             reward_pred = sampling_reward_results["selected_values"][0,0,:reward_group_size]
             rtg_pred = sampling_reward_results["selected_values"][0,0,reward_group_size:]
             # Collect predicted rewards - preserve the full [10,14] structure
-            reward_pred_np = reward_pred.detach().cpu().float().numpy()[0]  # Shape: [10,14]
+            reward_pred_np = reward_pred.detach().cpu().float().numpy()  # Shape: [10,14]
             all_predicted_rewards.append(reward_pred_np)
             
             # Collect real rewards for the next reward_group_size steps
