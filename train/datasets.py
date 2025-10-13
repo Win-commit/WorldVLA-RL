@@ -133,6 +133,9 @@ class RewardActionDataset(Dataset):
         scene = self.scenes[idx]
 
         prompt: str = scene["text"]
+        # 在stage2时，有0.2的概率将prompt设为空字符串以增加对指令的遵循
+        if self.stage == "stage2" and random.random() < 0.2:
+            prompt = ""
         image_tokens_path: List[str] = scene["image"]
         rewards: List[np.ndarray] = scene["reward"]
         rtgs: List[np.ndarray] = scene["returnToGo"]
