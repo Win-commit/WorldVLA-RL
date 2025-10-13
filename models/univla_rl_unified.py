@@ -654,14 +654,15 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                     # rwd_beg
                     parts2 += [static['rwd_beg']]
                     labels2 += [-100]
-                    selected_reward_hs = critical_segments[i, j, :, :].unsqueeze(0)  # [1, G+1, H]
+                    #Temp: 暂时训练的时候去掉rtg
+                    selected_reward_hs = critical_segments[i, j, :-1, :].unsqueeze(0)  # [1, G+1, H]
                     if self.detach_selected_reward_hs:
                         selected_reward_hs = selected_reward_hs.detach()
                     parts2.append(selected_reward_hs)
 
-                    assert self.reward_group_size + 1 == selected_reward_hs.size(1), f"reward_group_size: {self.reward_group_size}, selected_reward_hs.size(1): {selected_reward_hs.size(1)}"
+                    assert self.reward_group_size + 1 - 1 == selected_reward_hs.size(1), f"reward_group_size: {self.reward_group_size}, selected_reward_hs.size(1): {selected_reward_hs.size(1)}"
                     
-                    labels2 += [-100] * (self.reward_group_size + 1)  # reward + rtg部分不计算loss
+                    labels2 += [-100] * (self.reward_group_size + 1 - 1)  # reward + rtg部分不计算loss Temp: 暂时训练的时候去掉rtg
                     parts2.append(static['rwd_end'])
                     labels2 += [-100]
                 

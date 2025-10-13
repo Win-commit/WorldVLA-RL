@@ -447,12 +447,12 @@ def main():
         torch_dtype=torch.bfloat16 if training_args.bf16 else None,
     )
 
-    actor_model.model = Emu3Model.from_pretrained(
-        "/liujinxin/zhy/UniVLA/ckpts/UniVLA/UNIVLA_LIBERO_VIDEO_BS192-8K_original",
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        trust_remote_code=True,
-    )
+    # actor_model.model = Emu3Model.from_pretrained(
+    #     "/liujinxin/zhy/UniVLA/ckpts/UniVLA/UNIVLA_LIBERO_VIDEO_BS192-8K_original",
+    #     torch_dtype=torch.bfloat16,
+    #     attn_implementation="flash_attention_2",
+    #     trust_remote_code=True,
+    # )
 
 
     rank = getattr(training_args, 'local_rank', 0)
