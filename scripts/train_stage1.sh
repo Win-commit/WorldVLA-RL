@@ -61,4 +61,5 @@ torchrun \
     --remove_unused_columns False \
     --dataloader_pin_memory True \
     --dataloader_drop_last True \
-    --exp_name $EXP_NAME 
+    --exp_name $EXP_NAME \
+    --resume_from_checkpoint "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA_MSE/checkpoint-4500"

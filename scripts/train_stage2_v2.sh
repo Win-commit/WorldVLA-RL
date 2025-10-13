@@ -11,12 +11,12 @@ wandb login $API_KEY
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE=${1:-stage2}  
-EXP_NAME="STAGE2_EMABalance_StateNorm_Actor_UNIVLA8k_original_Videomode"
+EXP_NAME="STAGE2_EMABalance_StateNorm_CVAE_L1_Actor_8k_original_Videomode"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-ENV_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk/checkpoint-1500
-ACTOR_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk/checkpoint-1500
+ENV_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-8000
+ACTOR_MODEL_PATH=/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-8000
 # 设置STAGE特定参数
 if [ "$STAGE" = "stage1" ]; then
     STAGE_ARGS="--stage stage1 --parallel_mode False"
@@ -95,7 +95,7 @@ torchrun \
     --remove_unused_columns False \
     --dataloader_pin_memory True \
     --dataloader_drop_last True  \
-    --exp_name "STAGE2_EMABalance_StateNorm_Actor_UNIVLA8k_original_Videomode" \
+    --exp_name $EXP_NAME \
     --report_to "wandb"
 
 for PID in "${SERVER_PIDS[@]}"; do

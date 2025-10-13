@@ -27,6 +27,7 @@ import pickle
 import logging
 import random
 from datetime import datetime
+import pathlib
 
 # 设置日志格式
 logging.basicConfig(
@@ -374,31 +375,43 @@ def main():
     # Parse arguments
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
+    if not os.path.exists(training_args.output_dir):
+        os.makedirs(training_args.output_dir)
+        
     # Initialize wandb
     if training_args.report_to and "wandb" in training_args.report_to:
-        wandb.init(
-            project=training_args.exp_name,
-            name=f"training_{training_args.run_name or 'default'}",
-            config={
-                "actor_model_path": model_args.actor_model_path,
-                "data_path": data_args.data_path,
-                "learning_rate": training_args.learning_rate,
-                "batch_size": training_args.per_device_train_batch_size,
-                "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
-                "max_steps": training_args.max_steps,
-                "frames": data_args.frames,
-                "action_frames": data_args.action_frames,
-                "stage": model_args.stage,
-                "parallel_mode": model_args.parallel_mode,
-                "parallel_reward_groups": model_args.parallel_reward_groups,
-                "reward_group_size": model_args.reward_group_size,
-                "p": model_args.p,
-                "gamma": model_args.gamma,
-                "noise_factor": model_args.noise_factor,
-                "env_servers": model_args.env_servers
-            }
-        )
+        if training_args.resume_from_checkpoint:
+            run_id = (pathlib.Path(training_args.output_dir).resolve() / "wandb_id.txt").read_text().strip()
+            wandb.init(
+                project=training_args.exp_name,
+                id=run_id, 
+                resume="must"
+            )
+        else:
+            wandb.init(
+                project=training_args.exp_name,
+                name=f"training_{training_args.run_name or 'default'}",
+                config={
+                    "actor_model_path": model_args.actor_model_path,
+                    "data_path": data_args.data_path,
+                    "learning_rate": training_args.learning_rate,
+                    "batch_size": training_args.per_device_train_batch_size,
+                    "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+                    "max_steps": training_args.max_steps,
+                    "frames": data_args.frames,
+                    "action_frames": data_args.action_frames,
+                    "stage": model_args.stage,
+                    "parallel_mode": model_args.parallel_mode,
+                    "parallel_reward_groups": model_args.parallel_reward_groups,
+                    "reward_group_size": model_args.reward_group_size,
+                    "p": model_args.p,
+                    "gamma": model_args.gamma,
+                    "noise_factor": model_args.noise_factor,
+                    "env_servers": model_args.env_servers
+                }
+            )
+            (pathlib.Path(training_args.output_dir).resolve() / "wandb_id.txt").write_text(wandb.run.id)
+
 
     # Load tokenizer
     tokenizer = Emu3Tokenizer.from_pretrained(

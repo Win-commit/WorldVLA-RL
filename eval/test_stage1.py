@@ -136,10 +136,10 @@ def visualize_rewards_comparison(pred_rewards, real_rewards, reward_names, save_
 
 
 if __name__ == "__main__":
-    env_model_path = "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-500"
-    data_path = "/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm.pkl"
+    env_model_path = "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-8000"
+    data_path = "/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl"
     history_manager = HistoryManager(window_size=2)
-    save_dir = "reward_visualizations-500"
+    save_dir = "rtg_8k"
     action_frames = 10
     reward_group_size = 10
     tokenizer = Emu3Tokenizer.from_pretrained(
@@ -206,6 +206,8 @@ if __name__ == "__main__":
         # Prepare to collect predicted and ground truth rewards
         all_predicted_rewards = []
         all_real_rewards = []
+        all_predicted_rtgs = []
+        all_real_rtgs = []
         Loss = []
         for i in range(len(imge_tokens)):
             main_prompt = format_video_prompt(tokenizer, imge_tokens[i:i+1])
@@ -219,10 +221,14 @@ if __name__ == "__main__":
             
             #predict reward and rtg
             reward_pred = sampling_reward_results["selected_values"][0,0,:reward_group_size]
-            rtg_pred = sampling_reward_results["selected_values"][0,0,reward_group_size:]
+            rtg_pred = sampling_reward_results["selected_values"][0,0,reward_group_size:] #一个实数
+
+            rtg_pred_10 = sampling_reward_results["rtg_preds"][0,0,:]
+            rtg_pred_10_np = rtg_pred_10.detach().cpu().float().numpy()
+            
+            
             # Collect predicted rewards - preserve the full [10,14] structure
             reward_pred_np = reward_pred.detach().cpu().float().numpy()  # Shape: [10,14]
-            all_predicted_rewards.append(reward_pred_np)
             
             # Collect real rewards for the next reward_group_size steps
             start_idx = i * action_frames
@@ -233,18 +239,22 @@ if __name__ == "__main__":
                 # Get available data
                 available_length = len(reward_tensor) - start_idx
                 real_reward_segment = reward_tensor.numpy()[start_idx:len(reward_tensor)]
-                
+                real_rtg_segment = rtg_tensor.numpy()[start_idx:len(rtg_tensor)]
                 # Instead of padding real data, truncate predicted rewards to match available data
                 reward_pred_np = reward_pred_np[:available_length]
-                
+                rtg_pred_np = rtg_pred_10_np[:available_length]
                 print(f"Timestep {i}: Truncated prediction from {reward_group_size} to {available_length} steps")
             else:
                 real_reward_segment = reward_tensor.numpy()[start_idx:end_idx]
-            loss = F.mse_loss(torch.from_numpy(reward_pred_np).to(device=device, dtype=torch.bfloat16), torch.from_numpy(real_reward_segment).to(device=device, dtype=torch.bfloat16))
+                real_rtg_segment = rtg_tensor.numpy()[start_idx:end_idx]
+            loss = F.smooth_l1_loss(torch.from_numpy(reward_pred_np).to(device=device, dtype=torch.bfloat16), torch.from_numpy(real_reward_segment).to(device=device, dtype=torch.bfloat16), reduction='sum', beta = 0.1)
             print(loss)
             Loss.append(loss.item())
             
             all_real_rewards.append(real_reward_segment)
+            all_predicted_rewards.append(reward_pred_np)
+            all_predicted_rtgs.append(rtg_pred_10_np)
+            all_real_rtgs.append(real_rtg_segment)
             
             history_manager.add_image(img_tokenized)
             history_manager.add_state(states_i)
@@ -284,7 +294,7 @@ if __name__ == "__main__":
         ]
         
         # Visualize rewards comparison
-        visualize_rewards_comparison(all_predicted_rewards, all_real_rewards, reward_names, save_dir=save_dir)
+        visualize_rewards_comparison(all_predicted_rtgs, all_real_rtgs, reward_names, save_dir=save_dir)
 
             
 

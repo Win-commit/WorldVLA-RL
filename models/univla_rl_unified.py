@@ -34,7 +34,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                  reward_group_size: int = 10,
                  p: float = 0.85,
                  gamma: float = 0.9,
-                 noise_factor: float = 0.6,
+                 noise_factor: float = 0.4,
                  detach_selected_reward_hs: bool = True):
         """
         Args:
@@ -324,7 +324,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         B, K, M, _, _ = reward_preds.shape
         device = reward_preds.device
         rewards = reward_preds[:, :, :, :self.reward_group_size, -1]  # [B,K,M,reward_group_size]
-        final_rtg = rtg_preds[:, :, :, self.reward_group_size-1, -1] 
+        final_rtg = rtg_preds[:, :, :, self.reward_group_size-1, -1]  # [B,K,M]
         
         time_weights = torch.pow(
             torch.tensor(self.gamma, device=device), 
@@ -336,6 +336,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         summed_rewards = weighted_rewards.sum(dim=-1)  # [B,K,M]
         rtg_weight = torch.pow(torch.tensor(self.gamma, device=device), torch.tensor(self.reward_group_size, device=device))
         final_scores = summed_rewards + rtg_weight * final_rtg  # [B,K,M]
+        #=============临时修改，rtg已知为纯噪声，推理的时候先去掉他============
+        final_scores = summed_rewards
         
         best_group_indices = torch.argmax(final_scores, dim=2)  # [B,K]
         
@@ -544,6 +546,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         #方便后续使用，直接把需要的reward和rtg返回
         critical_segments = []
         selected_values = []  # 存储解码后的 reward 和 rtg
+        # for test
+        rtg_preds_ls = []
         for i in range(B):
             for k in range(K):
                 best_idx = best_group_indices[i, k].item()
@@ -559,11 +563,16 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                     selected_values.append(reward_preds[i, k, best_idx, token_idx, :])  # [14]
                 selected_values.append(rtg_preds[i, k, best_idx, self.reward_group_size - 1, :])  # [14]
                 
+                rtg_preds_ls.append(rtg_preds[i, k, best_idx, :, :])  # [10, 14]
+                
         critical_segments = torch.cat(critical_segments, dim=0)  # [B*K*(S+1), dim]
         critical_segments = critical_segments.view(B, K, self.reward_group_size + 1, -1)
         
         selected_values = torch.stack(selected_values, dim=0)  # [B*K*(S+1), 14]
         selected_values = selected_values.view(B, K, self.reward_group_size + 1, -1)  # [B, K, S+1, 14]
+
+        rtg_preds_tensor = torch.cat(rtg_preds_ls, dim=0)  # [B*K*10, 14]
+        rtg_preds_tensor = rtg_preds_tensor.view(B, K, 10, -1)  # [B,K,10,14]
         
         # 返回奖励采样结果和模型状态
         return {
@@ -578,6 +587,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             'noise_norm': avg_noise_norm,
             'rwd_noise_ratio': rwd_noise_ratio,
             'rtg_noise_ratio': rtg_noise_ratio,
+            'rtg_preds':rtg_preds_tensor
         }
 
 
@@ -945,7 +955,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 prefix_parts += self.get_input_embeddings()(history["vision"][history_time])
                 prefix_parts += [static['state_beg'], self.proprio(history["state"][history_time]), static['state_end']]
                 prefix_parts += [static['rwd_beg']]
-                prefix_parts += [history["reward"][history_time].squeeze(1)]
+                #=============临时修改，rtg已知为纯噪声，推理的时候先去掉他============
+                prefix_parts += [history["reward"][history_time][:,:,:-1].squeeze(1)]
                 prefix_parts += [static['rwd_end']]
                 prefix_parts += [static['boa']]
                 prefix_parts += self.get_input_embeddings()(history["action"][history_time]).unsqueeze(1)
@@ -961,7 +972,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             if has_reward :
                     # rwd_beg
                     prefix_parts += [static['rwd_beg']]
-                    selected_reward_hs = reward_sampling_results["critical_segments"][0, j, :, :].unsqueeze(0)  # [1, G+1, H]
+                    #=============临时修改，rtg已知为纯噪声，推理的时候先去掉他============
+                    selected_reward_hs = reward_sampling_results["critical_segments"][0, j, :-1, :].unsqueeze(0)  # [1, G+1, H]
                     prefix_parts.append(selected_reward_hs)
                     prefix_parts.append(static['rwd_end'])
             

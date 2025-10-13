@@ -111,6 +111,7 @@ class EvaluationConfig:
     reward_group_size: int = 10
     num_open_loop_steps: int = 10
     visual_token_pattern: str = "<|visual token {token_id:0>6d}|>"
+    noise_factor: float = 0.4
     
     # LIBERO环境参数
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL
@@ -678,6 +679,7 @@ def eval_libero(cfg: EvaluationConfig) -> float:
             reward_group_size=cfg.reward_group_size,
             attn_implementation = "eager",
             torch_dtype=torch.bfloat16,
+            noise_factor = cfg.noise_factor,
         ).to(device)
         env_model.eval()
     

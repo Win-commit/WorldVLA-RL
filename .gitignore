@@ -5,6 +5,8 @@ logs/
 train/trush/
 eval/logs/
 eval/ablation/
+eval/reward_visual/
+eval/rtg_8k/
 datasets/libero/data/
 ckpts/
 id_rsa_lrz
