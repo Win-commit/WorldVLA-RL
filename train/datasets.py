@@ -167,8 +167,9 @@ class RewardActionDataset(Dataset):
         image_tokens = image_tokens[0::self.action_frames, ...]
         states_k = state_tensor[0::self.action_frames, ...]
         # rewards_k = reward_tensor[0::self.action_frames, ...]
-        reward_tensor = reward_tensor.reshape(self.group, self.action_frames, -1)
-        rtg_tensor = rtg_tensor.reshape(self.group, self.action_frames, -1)
+        #只预测最后一个维度的结果(前13维的平均值)减轻训练难度
+        reward_tensor = reward_tensor.reshape(self.group, self.action_frames, -1)[:, :, -1:]
+        rtg_tensor = rtg_tensor.reshape(self.group, self.action_frames, -1)[:, :, -1:]
         if gripper_tokens is not None:
             gripper_tokens = gripper_tokens[0::self.action_frames, ...]
 

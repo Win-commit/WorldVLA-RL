@@ -48,7 +48,7 @@ class MLPResNet(nn.Module):
 
 
 class ValueEncoder(nn.Module):
-    def __init__(self, input_dim=14, condition_dim=4096, latent_dim=14):
+    def __init__(self, input_dim=1, condition_dim=4096, latent_dim=13):
         super().__init__()
         current_dim = input_dim + condition_dim  
 
@@ -79,9 +79,9 @@ class ValueEncoder(nn.Module):
 class ValueDecoder(nn.Module):
     def __init__(
         self,
-        latent_dim=14,
+        latent_dim=13,
         condition_dim=4096,
-        output_dim=14,
+        output_dim=1,
     ):
         super().__init__()
         current_dim = latent_dim + condition_dim  # 4110

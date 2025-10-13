@@ -376,7 +376,7 @@ def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     if not os.path.exists(training_args.output_dir):
-        os.makedirs(training_args.output_dir)
+        os.makedirs(training_args.output_dir,exist_ok=True)
         
     # Initialize wandb
     if training_args.report_to and "wandb" in training_args.report_to:

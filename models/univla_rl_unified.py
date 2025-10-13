@@ -284,10 +284,10 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                     self.rtg_mse_ema = self.rtg_mse_ema * self.loss_ema_decay + (1 - self.loss_ema_decay) * rtg_mse.detach()
             total_loss = img_ce
             if reward_targets is not None:
-                rwd_w = torch.clamp(self.img_ce_ema.detach() / (self.rwd_mse_ema.detach() + eps), 0.1, 10.0)
+                rwd_w = torch.clamp(self.img_ce_ema.detach() / (self.rwd_mse_ema.detach() + eps), 0.05, 10.0)
                 total_loss = total_loss + rwd_w * rwd_mse
             if rtg_targets is not None:
-                rtg_w = torch.clamp(self.img_ce_ema.detach() / (self.rtg_mse_ema.detach() + eps), 0.1, 10.0)
+                rtg_w = torch.clamp(self.img_ce_ema.detach() / (self.rtg_mse_ema.detach() + eps), 0.05, 10.0)
                 total_loss = total_loss + rtg_w * rtg_mse
         else:
             total_loss = (0.005 * img_ce) + rwd_mse + rtg_mse

@@ -139,7 +139,7 @@ if __name__ == "__main__":
     env_model_path = "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-8000"
     data_path = "/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl"
     history_manager = HistoryManager(window_size=2)
-    save_dir = "rtg_8k"
+    save_dir = "eposide_1234"
     action_frames = 10
     reward_group_size = 10
     tokenizer = Emu3Tokenizer.from_pretrained(
@@ -169,7 +169,7 @@ if __name__ == "__main__":
     with open(data_path, "rb") as f:
         data = pickle.load(f)
 
-    for item in data[1:2]:
+    for item in data[1234:1235]:
         history_manager.reset()
         task_description = item["text"]
         image = item["image"]
@@ -294,7 +294,7 @@ if __name__ == "__main__":
         ]
         
         # Visualize rewards comparison
-        visualize_rewards_comparison(all_predicted_rtgs, all_real_rtgs, reward_names, save_dir=save_dir)
+        visualize_rewards_comparison(all_predicted_rewards, all_real_rewards, reward_names, save_dir=save_dir)
 
             
 
