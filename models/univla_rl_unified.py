@@ -620,7 +620,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         static = {k: self.get_input_embeddings()(torch.full((1,1), v, device=device)) for k,v in self.ids.items() if k!='pad'}
         pad_emb = self.get_input_embeddings()(torch.full((1,1), self.ids['pad'], device=device))
         img_embs = self.get_input_embeddings()(image_token_ids)        # [B,K,L_img,H]
-        state_embs = self.proprio(states)             # [B,K,H]
+        #================STATELESS=============================
+        # state_embs = self.proprio(states)             # [B,K,H]
         
         # 检查是否有reward信息
         has_reward = reward_sampling_results is not None
@@ -647,8 +648,9 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             for j in range(K):
                 parts2.append(img_embs[i:i+1, j])
                 labels2 += [-100] * L_img  # image部分不计算loss
-                parts2 += [static['state_beg'], state_embs[i:i+1, j:j+1, :], static['state_end']]
-                labels2 += [-100, -100, -100]  # state标记不计算loss
+                #================STATELESS=============================
+                # parts2 += [static['state_beg'], state_embs[i:i+1, j:j+1, :], static['state_end']]
+                # labels2 += [-100, -100, -100]  # state标记不计算loss
 
                 # 如果有reward信息，添加reward相关token
                 if has_reward :
