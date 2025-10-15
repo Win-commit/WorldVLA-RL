@@ -5,6 +5,8 @@ logs/
 train/trush/
 eval/logs/
 eval/ablation/
+eval/VAE/
+eval/visual_tmp/
 eval/reward_visual/
 eval/rtg_8k/
 datasets/libero/data/

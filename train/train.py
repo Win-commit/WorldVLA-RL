@@ -14,7 +14,7 @@ from models.univla_rl_unified import Emu3UnifiedRewardModel
 from models.Emu3.emu3.mllm.tokenization_emu3 import Emu3Tokenizer
 from models.Emu3.emu3.mllm.configuration_emu3 import Emu3Config,Emu3RewardConfig
 from datasets import RewardActionDataset, RewardAction_collate
-
+import pathlib
 os.environ["WANDB_BASE_URL"] = "https://api.bandw.top"
 
 
@@ -37,6 +37,7 @@ class DataArguments:
     visual_token_pattern: str = field(default="<|visual token {token_id:0>6d}|>")
     codebook_size: int = field(default=32768)
     action_tokenizer_path: str = field(default=None)
+    null_prompt_prob: float = field(default=0.15)
 
 @dataclass
 class TrainingArguments(HFTrainingArguments):
@@ -193,25 +194,53 @@ def main():
 # Parse arguments
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if not os.path.exists(training_args.output_dir):
+        os.makedirs(training_args.output_dir,exist_ok=True)
+
 
     # Initialize wandb
     if training_args.report_to and "wandb" in training_args.report_to:
-        wandb.init(
-            project=training_args.exp_name,
-            name=f"training_{training_args.run_name or 'default'}",
-            config={
-                "model_path": model_args.model_path,
-                "data_path": data_args.data_path,
-                "learning_rate": training_args.learning_rate,
-                "batch_size": training_args.per_device_train_batch_size,
-                "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
-                "max_steps": training_args.max_steps,
-                "frames": data_args.frames,
-                "action_frames": data_args.action_frames,
-                "stage": model_args.stage,
-                "parallel_mode": model_args.parallel_mode,
-            }
-        )
+        if training_args.resume_from_checkpoint:
+            # run_id = (pathlib.Path(training_args.output_dir).resolve() / "wandb_id.txt").read_text().strip()
+            # wandb.init(
+            #     project=training_args.exp_name,
+            #     id=run_id, 
+            #     resume="must"
+            # )
+            wandb.init(
+                project=training_args.exp_name,
+                name=f"training_{training_args.run_name or 'default'}",
+                config={
+                    "model_path": model_args.model_path,
+                    "data_path": data_args.data_path,
+                    "learning_rate": training_args.learning_rate,
+                    "batch_size": training_args.per_device_train_batch_size,
+                    "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+                    "max_steps": training_args.max_steps,
+                    "frames": data_args.frames,
+                    "action_frames": data_args.action_frames,
+                    "stage": model_args.stage,
+                    "parallel_mode": model_args.parallel_mode,
+                }
+            )
+        else:
+            wandb.init(
+                project=training_args.exp_name,
+                name=f"training_{training_args.run_name or 'default'}",
+                config={
+                    "model_path": model_args.model_path,
+                    "data_path": data_args.data_path,
+                    "learning_rate": training_args.learning_rate,
+                    "batch_size": training_args.per_device_train_batch_size,
+                    "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+                    "max_steps": training_args.max_steps,
+                    "frames": data_args.frames,
+                    "action_frames": data_args.action_frames,
+                    "stage": model_args.stage,
+                    "parallel_mode": model_args.parallel_mode,
+                }
+            )
+            (pathlib.Path(training_args.output_dir).resolve() / "wandb_id.txt").write_text(wandb.run.id)
 
     # Load tokenizer and config
     tokenizer = Emu3Tokenizer.from_pretrained(
@@ -241,6 +270,7 @@ def main():
 
     # 设置模型训练模式
     model.set_mode(parallel_mode=model_args.parallel_mode)
+
 
     # Enable gradient checkpointing if specified
     if training_args.gradient_checkpointing:

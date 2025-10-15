@@ -38,7 +38,7 @@ class RewardActionDataset(Dataset):
         self.group = args.frames             
         self.action_frames = args.action_frames  
         self.stage = stage
-        
+        self.null_prompt_prob = args.null_prompt_prob
         # 统一初始化action tokenizer（stage1时可能用不到，但保持接口一致）
         self.action_tokenizer_path = getattr(args, "action_tokenizer_path", None)
         if self.action_tokenizer_path:
@@ -134,7 +134,7 @@ class RewardActionDataset(Dataset):
 
         prompt: str = scene["text"]
         # 在stage2时，有0.2的概率将prompt设为空字符串以增加对指令的遵循
-        if self.stage == "stage2" and random.random() < 0.2:
+        if self.stage == "stage2" and random.random() < self.null_prompt_prob:
             prompt = ""
         image_tokens_path: List[str] = scene["image"]
         rewards: List[np.ndarray] = scene["reward"]

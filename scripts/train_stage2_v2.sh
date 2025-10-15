@@ -11,7 +11,7 @@ wandb login $API_KEY
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE=${1:-stage2}  
-EXP_NAME="STAGE2_EMABalance_StateNorm_CVAE_L1_Videomode_NoRTG"
+EXP_NAME="STAGE2_EMABalance_StateNorm_CVAE_L1_Videomode_NoRTG-8k"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 

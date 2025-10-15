@@ -336,7 +336,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         summed_rewards = weighted_rewards.sum(dim=-1)  # [B,K,M]
         rtg_weight = torch.pow(torch.tensor(self.gamma, device=device), torch.tensor(self.reward_group_size, device=device))
         final_scores = summed_rewards + rtg_weight * final_rtg  # [B,K,M]
-        #=============临时修改，rtg已知为纯噪声，推理的时候先去掉他============
+        #=============Temp:临时修改，rtg已知为纯噪声，推理的时候先去掉他============
         final_scores = summed_rewards
         
         best_group_indices = torch.argmax(final_scores, dim=2)  # [B,K]
@@ -396,7 +396,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                     parts += [static['state_beg'], self.proprio(history["state"][history_time]), static['state_end']]
                     history_length += 1 + 1 + 1
                     parts += [static['rwd_beg']]
-                    parts += [history["reward"][history_time].squeeze(1)]
+                    #=============Temp:临时修改，rtg已知为纯噪声，推理的时候先去掉他============
+                    parts += [history["reward"][history_time][:,:,:-1].squeeze(1)]
                     parts += [static['rwd_end']]
                     history_length += 1 + history["reward"][history_time].squeeze(1).shape[1] + 1
 
@@ -579,7 +580,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             'logits': logits,
             'reward_preds_group_mean': torch.mean(reward_preds[..., -1], dim=-1),
             'best_reward_group': best_group_indices, # [B,K]
-            'selected_values': selected_values, # [B,K,reward_group_size+1,14]
+            'selected_values': selected_values, # [B,K,reward_group_size+1,reward_dim]
             'hidden_states': h, # [B,max_len,H]
             'critical_segments': critical_segments, # [B,K,S+1,H]
             'context_lengths': context_lengths, # [B,K]
@@ -956,7 +957,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 prefix_parts += self.get_input_embeddings()(history["vision"][history_time])
                 prefix_parts += [static['state_beg'], self.proprio(history["state"][history_time]), static['state_end']]
                 prefix_parts += [static['rwd_beg']]
-                #=============临时修改，rtg已知为纯噪声，推理的时候先去掉他============
+                #=============Temp:临时修改，rtg已知为纯噪声，推理的时候先去掉他============
                 prefix_parts += [history["reward"][history_time][:,:,:-1].squeeze(1)]
                 prefix_parts += [static['rwd_end']]
                 prefix_parts += [static['boa']]
@@ -973,7 +974,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             if has_reward :
                     # rwd_beg
                     prefix_parts += [static['rwd_beg']]
-                    #=============临时修改，rtg已知为纯噪声，推理的时候先去掉他============
+                    #=============Temp:临时修改，rtg已知为纯噪声，推理的时候先去掉他============
                     selected_reward_hs = reward_sampling_results["critical_segments"][0, j, :-1, :].unsqueeze(0)  # [1, G+1, H]
                     prefix_parts.append(selected_reward_hs)
                     prefix_parts.append(static['rwd_end'])

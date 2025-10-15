@@ -48,7 +48,7 @@ class MLPResNet(nn.Module):
 
 
 class ValueEncoder(nn.Module):
-    def __init__(self, input_dim=1, condition_dim=4096, latent_dim=13):
+    def __init__(self, input_dim=14, condition_dim=4096, latent_dim=14):
         super().__init__()
         current_dim = input_dim + condition_dim  
 
@@ -79,9 +79,9 @@ class ValueEncoder(nn.Module):
 class ValueDecoder(nn.Module):
     def __init__(
         self,
-        latent_dim=13,
+        latent_dim=14,
         condition_dim=4096,
-        output_dim=1,
+        output_dim=14,
     ):
         super().__init__()
         current_dim = latent_dim + condition_dim  # 4110
@@ -121,9 +121,9 @@ def vae_loss(recon_x, x, mu, log_var, recon_weight=1.0, kl_weight=1.0, beta=0.1)
         kl_weight: KL散度的权重
     """
 
-    # recon_loss = F.smooth_l1_loss(recon_x, x, reduction='sum', beta=beta)
+    recon_loss = F.smooth_l1_loss(recon_x, x, reduction='sum', beta=beta)
     #做个对比实验看看
-    recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+    # recon_loss = F.mse_loss(recon_x, x, reduction='sum')
     # 2. KL散度损失 (KL Divergence)
     # KL(q(z|x) || p(z))，其中p(z)是标准正态分布
     kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())

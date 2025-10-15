@@ -11,7 +11,7 @@ NGPUS=8
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE="stage1"  
-EXP_NAME="STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA_MSE"
+EXP_NAME="STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_One-hot"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -28,10 +28,10 @@ torchrun \
     ${STAGE_ARGS} \
     --deepspeed configs/deepspeed/zero3_offload.json \
     --output_dir "logs/"${EXP_NAME} \
-    --learning_rate 5e-5 \
+    --learning_rate 8e-5 \
     --weight_decay 0.1 \
     --min_learning_rate 5e-6 \
-    --max_grad_norm 50.0 \
+    --max_grad_norm 5.0 \
     --adam_beta1 0.9 \
     --adam_beta2 0.95 \
     --adam_epsilon 1e-6 \
@@ -51,9 +51,9 @@ torchrun \
     --eval_strategy no \
     --seed 42 \
     --report_to "wandb" \
-    --logging_steps 4 \
+    --logging_steps 8 \
     --gradient_checkpointing True \
-    --gradient_accumulation_steps 6 \
+    --gradient_accumulation_steps 8 \
     --save_steps 500 \
     --save_strategy "steps" \
     --evaluation_strategy "no" \
@@ -62,4 +62,4 @@ torchrun \
     --dataloader_pin_memory True \
     --dataloader_drop_last True \
     --exp_name $EXP_NAME \
-    --resume_from_checkpoint "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA_MSE/checkpoint-4500"
+    --resume_from_checkpoint "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_One-hot/checkpoint-1000"
