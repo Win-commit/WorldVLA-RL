@@ -396,8 +396,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                     parts += [static['state_beg'], self.proprio(history["state"][history_time]), static['state_end']]
                     history_length += 1 + 1 + 1
                     parts += [static['rwd_beg']]
-                    #=============Temp:临时修改，rtg已知为纯噪声，推理的时候先去掉他============
-                    parts += [history["reward"][history_time][:,:,:-1].squeeze(1)]
+                    parts += [history["reward"][history_time][:,:,:].squeeze(1)]
                     parts += [static['rwd_end']]
                     history_length += 1 + history["reward"][history_time].squeeze(1).shape[1] + 1
 
@@ -737,7 +736,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         action_dim=7,
         time_horizon=10,
         do_sample=False,
-        auto_sample_reward=True,
+        auto_sample_reward=False,
         history = None
     ):
         """
@@ -775,7 +774,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         
         # 设置生成配置
         eoa_token_id = self.ids.get('eoa', 151845)  # eoa token id
-        last_token_id = self.tokenizer.pad_token_id - 1  # action token起始位置
+        last_token_id = self.tokenizer.pad_token_id - 1  # action token结束位置
         
         # 准备action token约束
         allowed_token_ids = list(range(last_token_id - action_vocab_size, last_token_id + 1)) + [eoa_token_id]
@@ -864,7 +863,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 states=states
             )
         
-        # 第二步：如果提供了action_token_ids，则进行动作生成
+        # 第二步：进行动作生成
         action_ce_loss = None
         
         if action_token_ids is not None:
@@ -941,7 +940,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                 for k,v in self.ids.items() if k!='pad'}
         pad_emb = self.get_input_embeddings()(torch.full((1,1), self.ids['pad'], device=device))
         img_embs = self.get_input_embeddings()(image_token_ids)
-        state_embs = self.proprio(states)
+        #=================Stateless==========
+        # state_embs = self.proprio(states)
         
         # 检查是否有reward信息
         has_reward = reward_sampling_results is not None
@@ -957,11 +957,13 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         if history is not None:
             for history_time in range(len(history["vision"])):
                 prefix_parts += self.get_input_embeddings()(history["vision"][history_time])
-                prefix_parts += [static['state_beg'], self.proprio(history["state"][history_time]), static['state_end']]
-                prefix_parts += [static['rwd_beg']]
-                #=============Temp:临时修改，rtg已知为纯噪声，推理的时候先去掉他============
-                prefix_parts += [history["reward"][history_time][:,:,:-1].squeeze(1)]
-                prefix_parts += [static['rwd_end']]
+                #=================Stateless==========
+                # prefix_parts += [static['state_beg'], self.proprio(history["state"][history_time]), static['state_end']]
+                if has_reward:
+                    prefix_parts += [static['rwd_beg']]
+                    #=============Temp:临时修改，rtg已知为纯噪声，推理的时候先去掉他============
+                    prefix_parts += [history["reward"][history_time][:,:,:-1].squeeze(1)]
+                    prefix_parts += [static['rwd_end']]
                 prefix_parts += [static['boa']]
                 prefix_parts += self.get_input_embeddings()(history["action"][history_time]).unsqueeze(1)
                 prefix_parts += [static['eoa']]
@@ -970,7 +972,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         K = image_token_ids.shape[1]  # 图像数量
         for j in range(K):
             prefix_parts.append(img_embs[0:1, j])
-            prefix_parts += [static['state_beg'], state_embs[0:1,j:j+1,:], static['state_end']]
+            #=================Stateless==========
+            # prefix_parts += [static['state_beg'], state_embs[0:1,j:j+1,:], static['state_end']]
         
             # 3. 如果有奖励信息，添加奖励部分          
             if has_reward :

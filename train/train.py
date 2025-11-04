@@ -221,6 +221,12 @@ def main():
                     "action_frames": data_args.action_frames,
                     "stage": model_args.stage,
                     "parallel_mode": model_args.parallel_mode,
+                    "null_prompt_prob": data_args.null_prompt_prob,
+                    "parallel_reward_groups": model_args.parallel_reward_groups,
+                    "reward_group_size": model_args.reward_group_size,
+                    "gamma": model_args.gamma,
+                    "noise_factor": model_args.noise_factor,
+                    "p": model_args.p,
                 }
             )
         else:
@@ -238,6 +244,12 @@ def main():
                     "action_frames": data_args.action_frames,
                     "stage": model_args.stage,
                     "parallel_mode": model_args.parallel_mode,
+                    "null_prompt_prob": data_args.null_prompt_prob,
+                    "parallel_reward_groups": model_args.parallel_reward_groups,
+                    "reward_group_size": model_args.reward_group_size,
+                    "gamma": model_args.gamma,
+                    "noise_factor": model_args.noise_factor,
+                    "p": model_args.p,
                 }
             )
             (pathlib.Path(training_args.output_dir).resolve() / "wandb_id.txt").write_text(wandb.run.id)

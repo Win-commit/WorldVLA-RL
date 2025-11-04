@@ -6,7 +6,6 @@ from tqdm import tqdm
 import tensorflow as tf
 from Helper import *
 import cv2
-#还没跑完！！！！！！
 
 sub_dataname_choices = ['libero_spatial_no_noops', "libero_goal_no_noops", "libero_object_no_noops", "libero_10_no_noops"]
 sub_dataname = sub_dataname_choices[3]

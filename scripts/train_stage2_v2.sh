@@ -11,7 +11,7 @@ wandb login $API_KEY
 
 DATAPATH='/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl'
 STAGE=${1:-stage2}  
-EXP_NAME="STAGE2_EMABalance_StateNorm_CVAE_L1_Videomode_NoRTG-8k"
+EXP_NAME="STAGE2_EMABalance_StateNorm_CVAE_L1_Videomode_fullprompt_NoRTG_NoState-8k"
 export PYTHONPATH=$(pwd)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -73,6 +73,7 @@ torchrun \
     --bf16 True \
     --tf32 True \
     --data_path ${DATAPATH} \
+    --null_prompt_prob 0 \
     --max_steps 20000 \
     --dataloader_num_workers 12 \
     --lr_scheduler_type "cosine_with_min_lr" \
@@ -85,10 +86,10 @@ torchrun \
     --max_position_embeddings 6400 \
     --eval_strategy no \
     --seed 42 \
-    --logging_steps 8 \
+    --logging_steps 20 \
     --gradient_checkpointing True \
     --gradient_accumulation_steps  10 \
-    --save_steps 500 \
+    --save_steps 1000 \
     --save_strategy "steps" \
     --evaluation_strategy "no" \
     --run_name "unified_${STAGE}_training_$(date +%Y%m%d_%H%M%S)" \
@@ -96,7 +97,7 @@ torchrun \
     --dataloader_pin_memory True \
     --dataloader_drop_last True  \
     --exp_name $EXP_NAME \
-    --report_to "wandb"
+    --report_to "wandb" 
 
 for PID in "${SERVER_PIDS[@]}"; do
     echo "Killing server with PID: $PID"

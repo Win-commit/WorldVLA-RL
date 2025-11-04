@@ -112,6 +112,7 @@ class EvaluationConfig:
     num_open_loop_steps: int = 10
     visual_token_pattern: str = "<|visual token {token_id:0>6d}|>"
     noise_factor: float = 0.4
+    gamma: float = 0.9
     
     # LIBERO环境参数
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL
@@ -443,7 +444,6 @@ def get_action(observation, task_description, model, tokenizer, image_processor,
             action_dim=7,
             time_horizon=NUM_ACTIONS_CHUNK,
             do_sample=False,
-            auto_sample_reward=True,
             history = history_manager.get_history() if history_manager is not None else None
         )
     
@@ -680,7 +680,9 @@ def eval_libero(cfg: EvaluationConfig) -> float:
             attn_implementation = "eager",
             torch_dtype=torch.bfloat16,
             noise_factor = cfg.noise_factor,
+            gamma = cfg.gamma
         ).to(device)
+        print("env_model loaded")
         env_model.eval()
     
     # 加载视觉处理器和分词器
@@ -691,7 +693,7 @@ def eval_libero(cfg: EvaluationConfig) -> float:
     image_processor.min_pixels = 80 * 80
     
     # 设置图像大小
-    resize_size = (200, 200)
+    resize_size = (256, 256)
     
     # 设置日志记录
     log_file, local_log_filepath, run_id = setup_logging(cfg)
@@ -758,7 +760,7 @@ if __name__ == "__main__":
                       help="任务套件: libero_spatial, libero_object, libero_goal, libero_10")
     parser.add_argument("--actor_ckpt", type=str, default="/liujinxin/zhy/ICLR2026/logs/STAGE2_TRAINER_STAGE1EMABalance/checkpoint-3500",
                       help="模型检查点路径")
-    parser.add_argument("--env_ckpt", type=str, default="/liujinxin/zhy/ICLR2026/logs/STAGE2_TRAINER_STAGE1EMABalance/checkpoint-3500",)
+    parser.add_argument("--env_ckpt", type=str, default="")
     parser.add_argument("--parallel_mode", type=bool, default=True, 
                       help="是否使用并行奖励采样模式")
     parser.add_argument("--parallel_reward_groups", type=int, default=10,
@@ -773,12 +775,15 @@ if __name__ == "__main__":
                       help="视觉token的模式字符串")
     parser.add_argument("--local_log_dir", type=str, default="/liujinxin/zhy/ICLR2026/eval/logs",
                       help="本地日志目录")
+    parser.add_argument("--noise_factor", type=float, default=0.4,
+                      help="噪声因子")
     args = parser.parse_args()
     
     # 创建配置
     cfg = EvaluationConfig()
     cfg.pretrained_checkpoint = args.actor_ckpt
-    cfg.env_ckpt = args.env_ckpt
+    if args.env_ckpt != "":
+        cfg.env_ckpt = args.env_ckpt
     cfg.parallel_mode = args.parallel_mode
     cfg.parallel_reward_groups = args.parallel_reward_groups
     cfg.reward_group_size = args.reward_group_size
@@ -786,6 +791,7 @@ if __name__ == "__main__":
     cfg.save_videos = True
     cfg.visual_token_pattern = args.visual_token_pattern
     cfg.local_log_dir = args.local_log_dir
+    cfg.noise_factor = args.noise_factor
     # 设置任务套件
     if args.task_suite == "libero_spatial":
         cfg.task_suite_name = TaskSuite.LIBERO_SPATIAL
