@@ -13,3 +13,6 @@ datasets/libero/data/
 ckpts/
 id_rsa_lrz
 id_rsa_lrz.pub
+CLAUDE.md
+/liujinxin/zhy/ICLR2026/models/action_patches/test
+/liujinxin/zhy/ICLR2026/eval/discard

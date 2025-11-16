@@ -136,12 +136,12 @@ def visualize_rewards_comparison(pred_rewards, real_rewards, reward_names, save_
 
 
 if __name__ == "__main__":
-    env_model_path = "/liujinxin/zhy/ICLR2026/logs/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-8000"
+    env_model_path = "/liujinxin/zhy/ICLR2026/logs/discard/after_VAE/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-8000"
     data_path = "/liujinxin/zhy/ICLR2026/datasets/libero/data/meta/libero_all_norm_patched.pkl"
     history_manager = HistoryManager(window_size=2)
-    save_dir = "visual_tmp/eposide_100_wOrtg_gamma0.99_NoNoise"
+    save_dir = "visual_tmp/eposide_100_wOrtg_gamma0.9_NoNoise"
     action_frames = 10
-    parallel_reward_groups = 10
+    parallel_reward_groups = 50
     reward_group_size = 10
     tokenizer = Emu3Tokenizer.from_pretrained(
             env_model_path,
@@ -158,7 +158,7 @@ if __name__ == "__main__":
                 reward_group_size=reward_group_size,
                 attn_implementation = "eager",
                 torch_dtype=torch.bfloat16,
-                gamma=0.99
+                gamma=0.9
             ).to(device)
     
     for param in env_model.parameters():
