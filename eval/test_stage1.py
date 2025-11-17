@@ -141,7 +141,7 @@ if __name__ == "__main__":
     history_manager = HistoryManager(window_size=2)
     save_dir = "visual_tmp/eposide_100_wOrtg_gamma0.9_NoNoise"
     action_frames = 10
-    parallel_reward_groups = 50
+    parallel_reward_groups = 10
     reward_group_size = 10
     tokenizer = Emu3Tokenizer.from_pretrained(
             env_model_path,

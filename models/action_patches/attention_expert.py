@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any, Tuple, List
 from .dit_blocks import DiTBlock, SinusoidalPositionEmbeddings, ActionRotaryPosEmbed
+import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class CrossAttentionActionExpert(nn.Module):
@@ -16,10 +20,10 @@ class CrossAttentionActionExpert(nn.Module):
     def __init__(
         self,
         action_dim: int = 7,
-        visual_dim: int = 4096,
+        dynamic_dim: int = 4096,
         hidden_dim: int = 2048,
         cross_attention_dim: int = 4096,  #matches dynamic model's hidden dim
-        num_layers: int = 12,  # More layers for cross-attention
+        num_layers: int = 6,  # More layers for cross-attention
         num_heads: int = 16,
         mlp_ratio: float = 4.0,
         drop_rate: float = 0.1,
@@ -29,13 +33,12 @@ class CrossAttentionActionExpert(nn.Module):
         rope_dim: Optional[int] = None,
         base_seq_length: int = 100,
         # Reward conditioning
-        use_reward_conditioning: bool = True,
-        reward_dim: int = 14,
+        use_reward_conditioning: bool = True
     ):
         super().__init__()
 
         self.action_dim = action_dim
-        self.visual_dim = visual_dim
+        self.visual_dim = dynamic_dim
         self.hidden_dim = hidden_dim
         self.cross_attention_dim = cross_attention_dim
         self.num_layers = num_layers
@@ -67,14 +70,14 @@ class CrossAttentionActionExpert(nn.Module):
                 theta=10000.0,
             )
 
-        # Reward conditioning (if enabled)
-        conditioning_dim = visual_dim
+        # Reward conditioning (if enabled) ???????????????????????????????????????????????????????????????????????????????????
+        conditioning_dim = dynamic_dim
         if use_reward_conditioning:
-            conditioning_dim += reward_dim
-            self.reward_proj = nn.Linear(reward_dim, reward_dim)  # Project to reward_dim, not hidden_dim
+            conditioning_dim += dynamic_dim
+            self.reward_proj = nn.Linear(dynamic_dim, dynamic_dim)  # Project to reward_dim, not hidden_dim
 
         # Visual conditioning projection
-        self.visual_proj = nn.Linear(visual_dim, hidden_dim)
+        self.visual_proj = nn.Linear(dynamic_dim, hidden_dim)
 
         # Combined conditioning for cross-attention
         # Note: conditioning_proj input dimension should match conditioning_dim (visual_dim + reward_dim)
@@ -178,8 +181,7 @@ class CrossAttentionActionExpert(nn.Module):
         dynamic_hidden_states: torch.Tensor,
         visual_features: torch.Tensor,
         reward_features: Optional[torch.Tensor] = None,
-        dynamic_context: Optional[torch.Tensor] = None,
-        attention_positions: Optional[List[int]] = None,
+        dynamic_context: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Forward pass for cross-attention action expert
@@ -203,8 +205,7 @@ class CrossAttentionActionExpert(nn.Module):
             dynamic_context = self.extract_dynamic_context(
                 dynamic_hidden_states=dynamic_hidden_states,
                 visual_features=visual_features,
-                reward_features=reward_features,
-                attention_positions=attention_positions
+                reward_features=reward_features
             )
 
         # Extract conditioning features
@@ -258,9 +259,7 @@ class CrossAttentionActionExpert(nn.Module):
         dynamic_hidden_states: torch.Tensor,
         visual_features: torch.Tensor,
         reward_features: Optional[torch.Tensor],
-        target_actions: torch.Tensor,
-        seq_lengths: Optional[torch.Tensor] = None,
-        attention_positions: Optional[List[int]] = None,
+        target_actions: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
         Compute flow matching loss
@@ -299,8 +298,7 @@ class CrossAttentionActionExpert(nn.Module):
             timesteps=timesteps,
             dynamic_hidden_states=dynamic_hidden_states,
             visual_features=visual_features,
-            reward_features=reward_features,
-            attention_positions=attention_positions
+            reward_features=reward_features
         )
 
         # Compute MSE loss with SD3-style weighting
@@ -311,43 +309,21 @@ class CrossAttentionActionExpert(nn.Module):
         loss_weights = 1.0 / (sigma.view(-1, 1, 1) ** 2 + 1e-8)
         flow_loss = flow_loss * loss_weights
 
-        # Apply sequence length masking if provided
-        if seq_lengths is not None:
-            mask = torch.arange(seq_len, device=target_actions.device).unsqueeze(0) < seq_lengths.unsqueeze(1)
-            mask = mask.unsqueeze(-1).expand_as(flow_loss)
-            flow_loss = flow_loss * mask
-            flow_loss = flow_loss.sum() / mask.sum()
-        else:
-            flow_loss = flow_loss.mean()
+        flow_loss = flow_loss.mean()
 
         # Additional metrics
         with torch.no_grad():
             # Flow magnitude
             flow_magnitude = predicted_flow.norm(dim=-1).mean()
 
-            # Cross-attention analysis (for debugging)
-            if hasattr(self, '_analyze_attention'):
-                attention_weights = self._analyze_attention(
-                    hidden_states=hidden_states,
-                    context=dynamic_context
-                )
-                attention_entropy = -(attention_weights * torch.log(attention_weights + 1e-8)).sum(dim=-1).mean()
-            else:
-                attention_entropy = torch.tensor(0.0, device=target_actions.device)
-
-            # Action prediction quality
-            action_error = torch.tensor(0.0, device=target_actions.device)
 
         return {
             'loss': flow_loss,
             'flow_loss': flow_loss,
-            'flow_magnitude': flow_magnitude,
-            'attention_entropy': attention_entropy,
-            'action_error': action_error,
             'sigma_mean': sigma.mean(),
             'timestep_mean': timesteps.mean(),
             'target_flow_norm': target_flow.norm(dim=-1).mean(),
-            'predicted_flow_norm': predicted_flow.norm(dim=-1).mean(),
+            'predicted_flow_norm': flow_magnitude
         }
 
     @torch.no_grad()
@@ -429,6 +405,113 @@ class CrossAttentionActionExpert(nn.Module):
         """Get parameters that should be trained (excluding frozen components)"""
         return [p for n, p in self.named_parameters() if p.requires_grad]
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_path: str,
+        map_location: str = "cpu",
+        **kwargs
+    ) -> "CrossAttentionActionExpert":
+        """Load model from saved checkpoint
+
+        Args:
+            model_path: Path to model checkpoint or directory containing checkpoint
+            map_location: Device to map tensors to
+            **kwargs: Additional arguments to override config
+
+        Returns:
+            Loaded CrossAttentionActionExpert model
+        """
+        # Check if path is directory or file
+        if os.path.isdir(model_path):
+            # Look for pytorch_model.bin or model.safetensors
+            import glob
+            checkpoint_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
+            checkpoint_files.extend(glob.glob(os.path.join(model_path, "model.safetensors")))
+            if checkpoint_files:
+                state_dict_path = checkpoint_files[0]
+            else:
+                # Try loading all files in directory
+                state_dict_path = model_path
+        else:
+            state_dict_path = model_path
+
+        if not os.path.exists(state_dict_path):
+            raise FileNotFoundError(f"Model checkpoint not found at: {model_path}")
+
+        # Load state dict
+        try:
+            state_dict = torch.load(state_dict_path, map_location=map_location, weights_only=False)
+        except Exception:
+            # Fallback to weights_only=True
+            state_dict = torch.load(state_dict_path, map_location=map_location, weights_only=True)
+
+        # Try to load config from config.json if it exists
+        if os.path.isdir(model_path):
+            config_path = os.path.join(model_path, "config.json")
+        else:
+            config_path = os.path.join(os.path.dirname(model_path), "config.json")
+
+        if os.path.exists(config_path):
+            import json
+            with open(config_path, 'r') as f:
+                config_dict = json.load(f)
+            # Merge with kwargs (kwargs takes precedence)
+            for key, value in kwargs.items():
+                if key in config_dict:
+                    config_dict[key] = value
+            # Create instance with config
+            instance = cls(**config_dict)
+        else:
+            # Use default config
+            instance = cls(**kwargs)
+
+        # Load weights
+        missing_keys, unexpected_keys = instance.load_state_dict(state_dict, strict=False)
+
+        if missing_keys:
+            logger.warning(f"Missing keys in checkpoint: {missing_keys}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys in checkpoint: {unexpected_keys}")
+
+        logger.info(f"Successfully loaded model from {model_path}")
+        return instance
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+        """Save model and configuration to a directory
+
+        Args:
+            save_directory: Directory to save the model
+            **kwargs: Additional arguments
+        """
+        os.makedirs(save_directory, exist_ok=True)
+
+        # Save model weights
+        model_path = os.path.join(save_directory, "pytorch_model.bin")
+        torch.save(self.state_dict(), model_path)
+
+        # Save config
+        config_dict = {
+            "action_dim": self.action_dim,
+            "dynamic_dim": self.visual_dim,
+            "hidden_dim": self.hidden_dim,
+            "cross_attention_dim": self.cross_attention_dim,
+            "num_layers": len(self.dit_blocks),
+            "num_heads": self.dit_blocks[0].num_heads if self.dit_blocks else 16,
+            "mlp_ratio": self.dit_blocks[0].mlp_ratio if self.dit_blocks else 4.0,
+            "drop_rate": self.dit_blocks[0].drop_rate if self.dit_blocks else 0.1,
+            "time_horizon": self.time_horizon,
+            "use_reward_conditioning": self.use_reward_conditioning,
+            "use_rotary_emb": self.use_rotary_emb,
+        }
+
+        config_path = os.path.join(save_directory, "config.json")
+        import json
+        with open(config_path, 'w') as f:
+            json.dump(config_dict, f, indent=2)
+
+        logger.info(f"Model saved to {save_directory}")
+
 
 
 if __name__ == "__main__":
@@ -437,20 +520,19 @@ if __name__ == "__main__":
     seq_len = 10
     action_dim = 7
     visual_dim = 4096
-    reward_dim = 14
+    reward_dim = 4096
     dyn_seq_len = 100
     dyn_hidden_dim = 4096
 
     # Initialize model
     model = CrossAttentionActionExpert(
         action_dim=action_dim,
-        visual_dim=visual_dim,
+        dynamic_dim=visual_dim,
         hidden_dim=2048,
         cross_attention_dim=dyn_hidden_dim,
         num_layers=12,
         num_heads=16,
-        use_reward_conditioning=True,
-        reward_dim=reward_dim
+        use_reward_conditioning=True
     )
 
     # Test data

@@ -14,9 +14,10 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
     def forward(self, time: torch.Tensor) -> torch.Tensor:
         device = time.device
+        dtype = time.dtype  # Preserve input dtype
         half_dim = self.dim // 2
         embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -embeddings)
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
@@ -101,6 +102,7 @@ class DiTBlock(nn.Module):
         """
 
         # AdaLN modulation
+        timestep = timestep.to(dtype=x.dtype)  # Ensure timestep has same dtype as x
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(timestep).chunk(6, dim=-1)
 
         # Self-attention (only for "self" and "both")
@@ -181,9 +183,10 @@ class ActionRotaryPosEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, seq_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = hidden_states.size(0)
-        dim = hidden_states.size(-1)  
+        dim = hidden_states.size(-1)
+        dtype = hidden_states.dtype  # Preserve input dtype
 
-        grid = torch.arange(seq_length, dtype=torch.float32, device=hidden_states.device).unsqueeze(0)
+        grid = torch.arange(seq_length, dtype=dtype, device=hidden_states.device).unsqueeze(0)
         grid = grid / self.base_seq_length
         grid = grid.unsqueeze(-1)
 
@@ -194,7 +197,7 @@ class ActionRotaryPosEmbed(nn.Module):
             math.log(end, self.theta),
             dim // 2,
             device=hidden_states.device,
-            dtype=torch.float32,
+            dtype=dtype,
         )
         freqs = freqs * math.pi / 2.0
         freqs = freqs * (grid * 2 - 1)
@@ -209,8 +212,8 @@ class ActionRotaryPosEmbed(nn.Module):
             sin_freqs = torch.cat([sin_padding, sin_freqs], dim=-1)
 
         # Expand for batch dimension
-        cos_freqs = cos_freqs.expand(batch_size, -1, -1)
-        sin_freqs = sin_freqs.expand(batch_size, -1, -1)
+        cos_freqs = cos_freqs.repeat(batch_size, 1, 1)
+        sin_freqs = sin_freqs.repeat(batch_size, 1, 1)
 
         return cos_freqs, sin_freqs
 
@@ -238,15 +241,22 @@ def apply_rotary_emb(
     if sin.shape[0] == 1 and batch_size > 1:
         sin = sin.repeat(batch_size, 1, 1)
 
-    # Ensure dtype is float32 for computation
-    x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)  # [B, S, H, D//2]
-    cos = cos.unflatten(2, (-1, 2))
-    sin = sin.unflatten(2, (-1, 2))
+    # Reshape x to separate complex components
+    x_reshaped = x.unflatten(-1, (-1, 2))  # [B, S, H, 2]
+    x_real = x_reshaped[..., 0]  # [B, S, H//2]
+    x_imag = x_reshaped[..., 1]  # [B, S, H//2]
+
+    # Reshape cos/sin
+    cos = cos.unflatten(-1, (-1, 2))  # [B, S, H//2, 2]
+    sin = sin.unflatten(-1, (-1, 2))  # [B, S, H//2, 2]
 
     # Apply rotation: [x_real * cos - x_imag * sin, x_real * sin + x_imag * cos]
     x_rotated = torch.stack([
-        x_real * cos - x_imag * sin,
-        x_real * sin + x_imag * cos
-    ], dim=-1).flatten(3)
+        x_real * cos[..., 0] - x_imag * sin[..., 0],
+        x_real * sin[..., 1] + x_imag * cos[..., 1]
+    ], dim=-1)
+
+    # Flatten the last two dimensions
+    x_rotated = x_rotated.flatten(-2)
 
     return x_rotated.type_as(x)

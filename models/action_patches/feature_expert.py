@@ -10,6 +10,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any, Tuple
 from dit_blocks import DiTBlock, SinusoidalPositionEmbeddings, ActionRotaryPosEmbed
+import logging
+import glob
+
+logger = logging.getLogger(__name__)
 
 
 class FeatureActionExpert(nn.Module):
@@ -18,7 +22,7 @@ class FeatureActionExpert(nn.Module):
 
     This approach extracts features from the dynamic model and uses them as conditioning
     for the flow matching process to generate actions.
-    500M
+    525M
     """
 
     def __init__(
@@ -42,9 +46,6 @@ class FeatureActionExpert(nn.Module):
         super().__init__()
 
         self.action_dim = action_dim
-        self.visual_dim = dynamic_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
         self.time_horizon = time_horizon
         self.use_reward_conditioning = use_reward_conditioning
         self.use_rotary_emb = use_rotary_emb
@@ -75,18 +76,11 @@ class FeatureActionExpert(nn.Module):
             nn.Dropout(drop_rate),
         )
 
-        # Reward aggregator: adaptive aggregation of reward tokens [B, S+1, H] -> [B, H]
         if use_reward_conditioning:
             self.reward_aggregator = nn.Sequential(
                 nn.Linear(dynamic_dim, dynamic_dim),
                 nn.GELU(approximate="tanh"),
                 nn.Linear(dynamic_dim, dynamic_dim)
-            )
-            # Attention weighting for time steps
-            self.reward_attention = nn.Sequential(
-                nn.Linear(dynamic_dim, 256),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(256, 1),
             )
 
         # Action embedding
@@ -114,11 +108,9 @@ class FeatureActionExpert(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Final layer norm
         self.final_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
 
 
-        # Initialize weights
         self._init_weights()
 
     def _init_weights(self):
@@ -139,8 +131,8 @@ class FeatureActionExpert(nn.Module):
 
         Args:
             visual_features: Visual features from dynamic model [B, visual_dim]
-            reward_features: Reward features from dynamic model [B, reward_dim] or [B, S+1, visual_dim]
-                              Can be either pre-aggregated [B, H] or time sequence [B, S+1, H]
+            reward_features: Reward features from dynamic model [B, reward_dim] or [B, S, visual_dim]
+                              Can be either pre-aggregated [B, H] or time sequence [B, S, H]
                               For time sequences, uses attention weighting over time dimension
 
         Returns:
@@ -149,12 +141,14 @@ class FeatureActionExpert(nn.Module):
         features = visual_features
 
         if self.use_reward_conditioning and reward_features is not None:
-            # Check if reward_features is a time sequence [B, S, H] or aggregated [B, H]
             if reward_features.dim() == 3:
-                # Time sequence: apply adaptive aggregation [B, S, H] -> [B, H]
-                reward_agg = self.reward_aggregator(reward_features)  # [B, S, H]
-                attention_scores = self.reward_attention(reward_features)  # [B, S, 1]
-                attention_weights = F.softmax(attention_scores.squeeze(-1), dim=1, dtype=reward_agg.dtype)  # [B, S]
+                reward_agg = self.reward_aggregator(reward_features)  # [B, reward_group_size, H]
+                reward_group_size = reward_agg.size(1)
+                decay_factor = 0.9
+
+                # Weights: [decay_factor^1, decay_factor^2, ..., decay_factor^reward_group_size]
+                indices = torch.arange(1, reward_group_size + 1, device=reward_agg.device, dtype=reward_agg.dtype)
+                attention_weights = (decay_factor ** indices).unsqueeze(0)  # [1, reward_group_size]
                 reward_features_agg = (reward_agg * attention_weights.unsqueeze(-1)).sum(dim=1)  # [B, H]
             else:
                 reward_features_agg = reward_features
@@ -176,8 +170,6 @@ class FeatureActionExpert(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Forward pass for action expert (predicts flow)
-
         Args:
             actions: Noisy actions [B, seq_len, action_dim]
             timesteps: Timesteps for flow matching [B,]
@@ -190,12 +182,12 @@ class FeatureActionExpert(nn.Module):
         """
         _, seq_len = actions.size(0), actions.size(1)
 
-        # Extract features from dynamic model
         conditioning_features = self.extract_features(visual_features, reward_features)
         conditioning_features = conditioning_features.unsqueeze(1).expand(-1, seq_len, -1)
 
         # Time embeddings
         time_emb = self.time_embed(timesteps)
+        time_emb = time_emb.to(dtype=actions.dtype)
         time_emb = self.time_mlp(time_emb)  # [B, hidden_dim]
 
         # Action embeddings
@@ -219,7 +211,6 @@ class FeatureActionExpert(nn.Module):
                 rotary_emb=rotary_emb
             )
 
-        # Final norm and projection
         hidden_states = self.final_norm(hidden_states)
         flow_prediction = self.action_proj_out(hidden_states)
 
@@ -227,40 +218,36 @@ class FeatureActionExpert(nn.Module):
 
     def compute_flow_loss(
         self,
-        visual_features: torch.Tensor,
-        reward_features: Optional[torch.Tensor],
+        reward_sampling_results: Dict,
         target_actions: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute flow matching loss
-
         Args:
-            visual_features: Visual features from dynamic model [B, visual_dim]
-            reward_features: Reward features from dynamic model [B, reward_dim] or [B, S+1, visual_dim]
+            reward_sampling_results: Dictionary containing sampled rewards from dynamic model
             target_actions: Target actions [B, seq_len, action_dim]
-            seq_lengths: Actual sequence lengths [B,]
-
         Returns:
             Dictionary with loss and metrics
         """
         batch_size, seq_len, action_dim = target_actions.shape
 
+        visual_features = reward_sampling_results['last_hidden_states'][torch.arange(batch_size), reward_sampling_results["last_image_token_pos"].squeeze(-1)]  # [B, visual_dim]
+
+        reward_features = reward_sampling_results["critical_segments"].squeeze(1)[:,:-1,:]  #[B, S, visual_dim] remove rtg represntation
+
         # Sample random timesteps
-        timesteps = torch.rand(batch_size, device=target_actions.device)
+        timesteps = torch.rand(batch_size, device=target_actions.device, dtype=target_actions.dtype)  # Uniformly sample t ∈ [0, 1]
 
         # Sample noise (Gaussian)
-        noise = torch.randn_like(target_actions)
+        noise = torch.randn_like(target_actions,dtype=target_actions.dtype)
 
-        sigma = timesteps  # sigma ∈ [0, 1]
+        sigma = timesteps
 
         # x(t) = (1-t) * x_1 + t * noise
         noisy_actions = (1.0 - sigma.view(-1, 1, 1)) * target_actions + sigma.view(-1, 1, 1) * noise
 
-        # Compute target flow (velocity field)
         # v = dx/dt = noise - actions
         target_flow = noise - target_actions
 
-        # Predict flow
         predicted_flow = self.forward(
             actions=noisy_actions,
             timesteps=timesteps,
@@ -268,19 +255,15 @@ class FeatureActionExpert(nn.Module):
             reward_features=reward_features,
         )
 
-        # Compute MSE loss with SD3-style weighting
         flow_loss = F.mse_loss(predicted_flow, target_flow, reduction='none')
 
-        # Apply SD3-style loss weighting
         # Weighting scheme: uniform timesteps, weight by 1/sigma^2 for numerical stability
         loss_weights = 1.0 / (sigma.view(-1, 1, 1) ** 2 + 1e-8)
         flow_loss = flow_loss * loss_weights
 
         flow_loss = flow_loss.mean()
 
-        # Additional metrics
         with torch.no_grad():
-            # Flow magnitude
             flow_magnitude = predicted_flow.norm(dim=-1).mean()
 
         return {
@@ -290,146 +273,154 @@ class FeatureActionExpert(nn.Module):
             'predicted_flow_norm': flow_magnitude,
         }
 
-    @torch.no_grad()
-    def sample_actions(
-        self,
-        visual_features: torch.Tensor,
-        reward_features: Optional[torch.Tensor] = None,
-        num_steps: int = 20,
-        solver: str = "euler",
-        stochastic: bool = False,
-        temperature: float = 1.0,
-    ) -> torch.Tensor:
-        """
-        Sample actions using Flow Matching ODE solver
+    # @torch.no_grad()
+    # def sample_actions(
+    #     self,
+    #     visual_features: torch.Tensor,
+    #     reward_features: Optional[torch.Tensor] = None,
+    #     num_steps: int = 20,
+    #     solver: str = "euler",
+    #     stochastic: bool = False,
+    #     temperature: float = 1.0,
+    # ) -> torch.Tensor:
+    #     """
+    #     Sample actions using Flow Matching ODE solver
 
-        Args:
-            visual_features: Visual features from dynamic model [B, visual_dim]
-            reward_features: Reward features from dynamic model [B, reward_dim] or [B, S+1, visual_dim]
-            num_steps: Number of discretization steps
-            solver: ODE solver type ('euler' or 'heun')
-            stochastic: Whether to use stochastic sampling (adds noise back)
-            temperature: Temperature for sampling
+    #     Args:
+    #         visual_features: Visual features from dynamic model [B, visual_dim]
+    #         reward_features: Reward features from dynamic model [B, reward_dim] or [B, S+1, visual_dim]
+    #         num_steps: Number of discretization steps
+    #         solver: ODE solver type ('euler' or 'heun')
+    #         stochastic: Whether to use stochastic sampling (adds noise back)
+    #         temperature: Temperature for sampling
 
-        Returns:
-            Sampled actions [B, seq_len, action_dim]
-        """
-        batch_size = visual_features.size(0)
-        device = visual_features.device
+    #     Returns:
+    #         Sampled actions [B, seq_len, action_dim]
+    #     """
+    #     batch_size = visual_features.size(0)
+    #     device = visual_features.device
 
-        # Initialize with pure noise (sigma=1.0)
-        actions = torch.randn(batch_size, self.time_horizon, self.action_dim, device=device)
+    #     # Initialize with pure noise (sigma=1.0)
+    #     actions = torch.randn(batch_size, self.time_horizon, self.action_dim, device=device)
 
-        # Discretize sigma from 1.0 -> 0.0
-        sigmas = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+    #     # Discretize sigma from 1.0 -> 0.0
+    #     sigmas = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
 
-        for i in range(num_steps):
-            current_sigma = sigmas[i].expand(batch_size)
-            next_sigma = sigmas[i + 1].expand(batch_size)
-            sigma_diff = next_sigma - current_sigma  # negative value
+    #     for i in range(num_steps):
+    #         current_sigma = sigmas[i].expand(batch_size)
+    #         next_sigma = sigmas[i + 1].expand(batch_size)
+    #         sigma_diff = next_sigma - current_sigma  # negative value
 
-            # Predict flow at current sigma
-            flow = self.forward(
-                actions=actions,
-                timesteps=current_sigma,
-                visual_features=visual_features,
-                reward_features=reward_features,
-            )
+    #         # Predict flow at current sigma
+    #         flow = self.forward(
+    #             actions=actions,
+    #             timesteps=current_sigma,
+    #             visual_features=visual_features,
+    #             reward_features=reward_features,
+    #         )
 
-            if stochastic:
-                # Genie-style stochastic sampling
-                # 1. Predict clean data x0
-                x0 = actions - current_sigma.view(-1, 1, 1) * flow
-                # 2. Re-add noise for next step
-                noise = torch.randn_like(actions)
-                actions = (1.0 - next_sigma.view(-1, 1, 1)) * x0 + next_sigma.view(-1, 1, 1) * noise
-            else:
-                # Deterministic Euler step
-                # dx/dσ = flow, so x_{i+1} = x_i + (σ_{i+1} - σ_i) * flow
-                actions = actions + sigma_diff.view(-1, 1, 1) * flow * temperature
+    #         if stochastic:
+    #             # Genie-style stochastic sampling
+    #             # 1. Predict clean data x0
+    #             x0 = actions - current_sigma.view(-1, 1, 1) * flow
+    #             # 2. Re-add noise for next step
+    #             noise = torch.randn_like(actions)
+    #             actions = (1.0 - next_sigma.view(-1, 1, 1)) * x0 + next_sigma.view(-1, 1, 1) * noise
+    #         else:
+    #             # Deterministic Euler step
+    #             # dx/dσ = flow, so x_{i+1} = x_i + (σ_{i+1} - σ_i) * flow
+    #             actions = actions + sigma_diff.view(-1, 1, 1) * flow * temperature
 
-        return actions
+    #     return actions
 
     def get_trainable_parameters(self):
         """Get parameters that should be trained (excluding frozen components)"""
-        return [p for n, p in self.named_parameters() if p.requires_grad]
+        return [p for _, p in self.named_parameters() if p.requires_grad]
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_path: str,
+        map_location: str = "cpu",
+        **kwargs
+    ) -> "FeatureActionExpert":
+        if os.path.isdir(model_path):
+            
+            checkpoint_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
+            checkpoint_files.extend(glob.glob(os.path.join(model_path, "model.safetensors")))
+            if checkpoint_files:
+                state_dict_path = checkpoint_files[0]
+            else:
+                state_dict_path = model_path
+        else:
+            state_dict_path = model_path
+
+        if not os.path.exists(state_dict_path):
+            raise FileNotFoundError(f"Model checkpoint not found at: {model_path}")
 
 
+        try:
+            state_dict = torch.load(state_dict_path, map_location=map_location, weights_only=False)
+        except Exception:
+            state_dict = torch.load(state_dict_path, map_location=map_location, weights_only=True)
+
+        if os.path.isdir(model_path):
+            config_path = os.path.join(model_path, "config.json")
+        else:
+            config_path = os.path.join(os.path.dirname(model_path), "config.json")
+
+        if os.path.exists(config_path):
+            import json
+            with open(config_path, 'r') as f:
+                config_dict = json.load(f)
+            # Merge with kwargs (kwargs takes precedence)
+            for key, value in kwargs.items():
+                if key in config_dict:
+                    config_dict[key] = value
+            # Create instance with config
+            instance = cls(**config_dict)
+        else:
+            # Use default config
+            instance = cls(**kwargs)
+
+        # Load weights
+        missing_keys, unexpected_keys = instance.load_state_dict(state_dict, strict=False)
+
+        if missing_keys:
+            logger.warning(f"Missing keys in checkpoint: {missing_keys}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys in checkpoint: {unexpected_keys}")
+
+        logger.info(f"Successfully loaded model from {model_path}")
+        return instance
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+ 
+        os.makedirs(save_directory, exist_ok=True)
+
+        # Save model weights
+        model_path = os.path.join(save_directory, "pytorch_model.bin")
+        torch.save(self.state_dict(), model_path)
+
+        # Save config
+        config_dict = {
+            "action_dim": self.action_dim,
+            "dynamic_dim": self.dynamic_dim,
+            "hidden_dim": self.hidden_dim,
+            "num_layers": len(self.dit_blocks),
+            "num_heads": self.dit_blocks[0].num_heads if self.dit_blocks else 16,
+            "mlp_ratio": self.dit_blocks[0].mlp_ratio if self.dit_blocks else 4.0,
+            "drop_rate": self.dit_blocks[0].drop_rate if self.dit_blocks else 0.1,
+            "time_horizon": self.time_horizon,
+            "use_reward_conditioning": self.use_reward_conditioning,
+            "use_rotary_emb": self.use_rotary_emb,
+            "feature_projection_dim": getattr(self, 'feature_projector', None) and
+                                   self.feature_projector[0].in_features if hasattr(self, 'feature_projector') else None,
+        }
+
+        config_path = os.path.join(save_directory, "config.json")
+        import json
+        with open(config_path, 'w') as f:
+            json.dump(config_dict, f, indent=2)
 
 
-if __name__ == "__main__":
-    # Test the feature-based action expert
-    '''
-    visual feature 以及language feature怎么从dynamic model拿出来
-    '''
-    batch_size = 4
-    seq_len = 10
-    action_dim = 7
-    visual_dim = 4096
-    reward_dim = 4096
-    reward_seq_len = 11  # S+1 where S=10
-
-    # Initialize model
-    model = FeatureActionExpert(
-        action_dim=action_dim,
-        visual_dim=visual_dim,
-        hidden_dim=2048,
-        num_layers=6,
-        num_heads=16,
-        use_reward_conditioning=True
-    )
-
-    # Test data
-    visual_features = torch.randn(batch_size, visual_dim)
-    reward_features = torch.randn(batch_size, reward_dim)
-    reward_features_3d = torch.randn(batch_size, reward_seq_len, visual_dim)  # 3D version
-    target_actions = torch.randn(batch_size, seq_len, action_dim)
-
-    # Test forward pass
-    model.train()
-
-    # Compute loss with 2D reward features
-    loss_dict_2d = model.compute_flow_loss(
-        visual_features=visual_features,
-        reward_features=reward_features,
-        target_actions=target_actions
-    )
-
-    print("Feature-based Action Expert Test (2D reward features):")
-    print(f"Loss: {loss_dict_2d['loss'].item():.6f}")
-
-    # Compute loss with 3D reward features (new feature)
-    loss_dict_3d = model.compute_flow_loss(
-        visual_features=visual_features,
-        reward_features=reward_features_3d,
-        target_actions=target_actions
-    )
-
-    print("Feature-based Action Expert Test (3D reward features):")
-    print(f"Loss: {loss_dict_3d['loss'].item():.6f}")
-
-    # Test sampling (deterministic)
-    sampled_actions = model.sample_actions(
-        visual_features=visual_features,
-        reward_features=reward_features,
-        num_steps=10,
-        stochastic=False
-    )
-
-    print(f"Sampled actions shape: {sampled_actions.shape}")
-    print(f"Deterministic sampling mean: {sampled_actions.mean().item():.6f}")
-
-    # Test sampling (stochastic)
-    sampled_actions_stoch = model.sample_actions(
-        visual_features=visual_features,
-        reward_features=reward_features,
-        num_steps=10,
-        stochastic=True
-    )
-
-    print(f"Stochastic sampling mean: {sampled_actions_stoch.mean().item():.6f}")
-    print(f"2D Flow loss mean: {loss_dict_2d['flow_loss'].item():.6f}")
-    print(f"3D Flow loss mean: {loss_dict_3d['flow_loss'].item():.6f}")
-    print(f"Target flow norm: {loss_dict_2d['target_flow_norm'].item():.6f}")
-    print(f"Predicted flow norm: {loss_dict_2d['predicted_flow_norm'].item():.6f}")
-    print("Test passed!")

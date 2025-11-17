@@ -13,7 +13,7 @@ TrainerCallback
 from models.univla_rl_unified import Emu3UnifiedRewardModel
 from models.Emu3.emu3.mllm.tokenization_emu3 import Emu3Tokenizer
 from models.Emu3.emu3.mllm.configuration_emu3 import Emu3Config,Emu3RewardConfig
-from datasets import RewardActionDataset, RewardAction_collate
+from train.datasets import RewardActionDataset, RewardAction_collate
 import pathlib
 os.environ["WANDB_BASE_URL"] = "https://api.bandw.top"
 
@@ -25,7 +25,6 @@ class ModelArguments:
     parallel_mode: bool = field(default=True, metadata={"help": "是否启用并行奖励采样模式(stage2专用)"})
     parallel_reward_groups: int = field(default=5, metadata={"help": "并行奖励组数(stage2专用)"})
     reward_group_size: int = field(default=10, metadata={"help": "每组奖励数(不含state value)"})
-    p: float = field(default=0.85, metadata={"help": "stage2执行奖励采样的概率"})
     gamma: float = field(default=0.9, metadata={"help": "时间加权参数(stage2专用)"})
     noise_factor: float = field(default=0.4, metadata={"help": "噪声因子"})
 
@@ -100,7 +99,7 @@ class UnifiedRewardTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         """通用损失计算，支持stage1和stage2"""
         # Unpack inputs
-        text_ids_list, image_token_ids, states, reward_targets, rtg_targets, action_token_ids = inputs
+        text_ids_list, image_token_ids, states, reward_targets, rtg_targets, action_token_ids, _ = inputs
         
         # Move to device and convert dtypes
         device = model.device
@@ -272,10 +271,8 @@ def main():
         parallel_mode=model_args.parallel_mode,
         parallel_reward_groups=model_args.parallel_reward_groups,
         reward_group_size=model_args.reward_group_size,
-        p=model_args.p,
         gamma=model_args.gamma,
         noise_factor=model_args.noise_factor,
-        detach_selected_reward_hs=True,
         attn_implementation= training_args.attn_type,
         torch_dtype=torch.bfloat16 if training_args.bf16 else None,
     )

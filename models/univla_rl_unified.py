@@ -31,10 +31,9 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
                  parallel_mode: bool = False, 
                  parallel_reward_groups: int = 5, 
                  reward_group_size: int = 10,
-                 p: float = 0.85,
                  gamma: float = 0.9,
-                 noise_factor: float = 0.4,
-                 detach_selected_reward_hs: bool = True):
+                 noise_factor: float = 0.4
+                 ):
         """
         Args:
             config: 模型配置
@@ -45,7 +44,6 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             p: Stage2执行奖励采样的概率
             gamma: 时间加权参数
             noise_factor: 噪声因子
-            detach_selected_reward_hs: 是否在第二次前向中分离选定的reward隐藏状态
         """
         super().__init__(config)
         self.tokenizer = tokenizer
@@ -59,8 +57,6 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         # 并行奖励采样参数
         self.parallel_reward_groups = parallel_reward_groups
         self.reward_group_size = reward_group_size
-        self.use_parallel_reward_sampling = parallel_mode
-        self.p = p
 
 
         # 噪声强度
@@ -68,9 +64,6 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
 
         # 时间加权参数
         self.gamma = gamma
-        
-        # 是否分离选定的reward隐藏状态
-        self.detach_selected_reward_hs = detach_selected_reward_hs
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.reward_encoder = ValueEncoder()
@@ -341,7 +334,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         best_group_indices = torch.argmax(final_scores, dim=2)  # [B,K]
         
         return best_group_indices
-
+    
+    @torch.no_grad()
     def sample_rewards(self,
         text_ids_list: List,
         image_token_ids: torch.LongTensor,
@@ -498,11 +492,14 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         outputs = self.model(
             inputs_embeds=inputs_embeds,
             custom_4d_attention_mask=custom_4d_mask,
-            return_dict=True
+            return_dict=True,
+            output_hidden_states=True
         )
         h = outputs.last_hidden_state                 # [B, max_len, H]
         logits = self.lm_head(h)
-        
+
+        # print(f"output_hidden_states len: {len(outputs.hidden_states)}") 33
+
         # reward/rtg preds with parallel sampling
         reward_preds = []
         reward_pos = []
@@ -535,8 +532,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
 
         best_group_indices = self.select_best_reward_groups(reward_preds, rtg_preds)
             
-        if self.detach_selected_reward_hs:
-            h = h.detach()
+        h = h.detach()
             
         # 计算平均噪声强度
         avg_noise_norm = sum(all_noise_norms) / len(all_noise_norms) if all_noise_norms else 0
@@ -581,7 +577,7 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             'reward_preds_group_mean': torch.mean(reward_preds[..., -1], dim=-1),
             'best_reward_group': best_group_indices, # [B,K]
             'selected_values': selected_values, # [B,K,reward_group_size+1,reward_dim]
-            'hidden_states': h, # [B,max_len,H]
+            'last_hidden_states': h, # [B,max_len,H]
             'last_image_token_pos': last_image_token_pos_tensor, # [B,K](In general [B,1])
             'critical_segments': critical_segments, # [B,K,S+1,H]
             'context_lengths': context_lengths, # [B,K]
@@ -592,537 +588,3 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
             'rtg_preds':rtg_preds_tensor
         }
 
-
-    # def generate_actions(self,
-    #     text_ids_list: List,
-    #     image_token_ids: torch.LongTensor,
-    #     states: torch.Tensor,
-    #     action_token_ids: List[torch.Tensor],
-    #     reward_sampling_results: Optional[Dict] = None
-    # ):
-    #     """
-    #     阶段2.2: 动作生成部分，使用最佳奖励组生成动作序列
-        
-    #     Args:
-    #         text_ids_list: 文本ID列表
-    #         image_token_ids: 图像token IDs
-    #         states: 机器人状态
-    #         action_token_ids: 动作token IDs (用于训练/评估)
-    #         reward_sampling_results: 奖励采样结果，包含隐藏状态、最佳奖励组等信息，如果为None则不使用reward
-            
-    #     Returns:
-    #         dict: 包含动作logits和损失等
-    #     """
-    #     B, K, L_img = image_token_ids.shape
-    #     device = image_token_ids.device
-    #     max_len = self.tokenizer.model_max_length
-        
-    #     # prepare embeddings
-    #     static = {k: self.get_input_embeddings()(torch.full((1,1), v, device=device)) for k,v in self.ids.items() if k!='pad'}
-    #     pad_emb = self.get_input_embeddings()(torch.full((1,1), self.ids['pad'], device=device))
-    #     img_embs = self.get_input_embeddings()(image_token_ids)        # [B,K,L_img,H]
-    #     #================STATELESS=============================
-    #     # state_embs = self.proprio(states)             # [B,K,H]
-        
-    #     # 检查是否有reward信息
-    #     has_reward = reward_sampling_results is not None
-        
-    #     # 如果有reward_sampling_results，获取必要信息
-    #     critical_segments = None
-        
-    #     if has_reward:
-    #         critical_segments = reward_sampling_results['critical_segments']
-        
-    #     seq2_list = []
-    #     mask2_list = []
-    #     action_labels_list = []  # 对应每个样本的完整labels（包括-100填充）
-    #     action_pos_ranges = []  # 记录每个样本(action_start, action_len)
-
-    #     for i, text_ids in enumerate(text_ids_list):
-    #         L_text = text_ids.size(0)
-    #         # 文本嵌入
-    #         t_emb = self.get_input_embeddings()(text_ids.unsqueeze(0))  # [1,L_text,H]
-    #         parts2 = [t_emb]
-    #         labels2 = [-100] * L_text  
-
-    #         # per-frame 部分
-    #         for j in range(K):
-    #             parts2.append(img_embs[i:i+1, j])
-    #             labels2 += [-100] * L_img  # image部分不计算loss
-    #             #================STATELESS=============================
-    #             # parts2 += [static['state_beg'], state_embs[i:i+1, j:j+1, :], static['state_end']]
-    #             # labels2 += [-100, -100, -100]  # state标记不计算loss
-
-    #             # 如果有reward信息，添加reward相关token
-    #             if has_reward :
-    #                 # rwd_beg
-    #                 parts2 += [static['rwd_beg']]
-    #                 labels2 += [-100]
-    #                 #Temp: 暂时训练的时候去掉rtg
-    #                 selected_reward_hs = critical_segments[i, j, :-1, :].unsqueeze(0)  # [1, G+1, H]
-    #                 if self.detach_selected_reward_hs:
-    #                     selected_reward_hs = selected_reward_hs.detach()
-    #                 parts2.append(selected_reward_hs)
-
-    #                 assert self.reward_group_size + 1 - 1 == selected_reward_hs.size(1), f"reward_group_size: {self.reward_group_size}, selected_reward_hs.size(1): {selected_reward_hs.size(1)}"
-                    
-    #                 labels2 += [-100] * (self.reward_group_size + 1 - 1)  # reward + rtg部分不计算loss Temp: 暂时训练的时候去掉rtg
-    #                 parts2.append(static['rwd_end'])
-    #                 labels2 += [-100]
-                
-    #             # 追加 action chunk：boa + action_ids + eoa
-    #             boa_emb = static['boa']
-    #             eoa_emb = static['eoa']
-    #             parts2.append(boa_emb)
-    #             labels2 += [-100]  # boa不计算loss
-                
-    #             act_ids_ij = action_token_ids[i][j].to(device).view(1, -1)
-    #             act_len_ij = act_ids_ij.size(1)
-    #             act_emb_ij = self.get_input_embeddings()(act_ids_ij)  # [1, T, H]
-    #             parts2.append(act_emb_ij)
-    #             labels2 += act_ids_ij.view(-1).tolist()  # action部分计算loss
-    #             parts2.append(eoa_emb)
-    #             labels2 += [-100]  # eoa不计算loss
-
-    #         # 拼接为单条序列
-    #         seq2_i = torch.cat(parts2, dim=1)  # [1, L2_i, H]
-    #         labels2_i = torch.tensor(labels2, device=device, dtype=torch.long)
-    #         # padding 或 截断
-    #         L2_i = seq2_i.size(1)
-    #         if L2_i < max_len:
-    #             pad_len = max_len - L2_i
-    #             seq2_i = torch.cat([seq2_i, pad_emb.expand(1, pad_len, self.hidden_dim)], dim=1)
-    #             labels2_i = torch.cat([labels2_i, torch.full((pad_len,), -100, device=device)], dim=0)
-    #             mask2_i = torch.cat([torch.ones(L2_i, device=device), torch.zeros(pad_len, device=device)], dim=0)
-    #         else:
-    #             seq2_i = seq2_i[:, :max_len, :]
-    #             labels2_i = labels2_i[:max_len]
-    #             mask2_i = torch.ones(max_len, device=device)
-
-    #         seq2_list.append(seq2_i)
-    #         mask2_list.append(mask2_i.unsqueeze(0))
-    #         action_labels_list.append(labels2_i.unsqueeze(0))
-
-    #     # batch 合并并进行第二次前向
-    #     inputs_embeds_2 = torch.cat(seq2_list, dim=0)  # [B, max_len, H]
-    #     attention_mask_2 = torch.cat(mask2_list, dim=0)  # [B, max_len]
-    #     action_labels = torch.cat(action_labels_list, dim=0)  # [B, max_len]
-    #     outputs2 = self.model(
-    #         inputs_embeds=inputs_embeds_2,
-    #         attention_mask=attention_mask_2,
-    #         return_dict=True,
-    #     )
-    #     h2 = outputs2.last_hidden_state
-    #     logits2 = self.lm_head(h2)  # [B, max_len, V]
-
-    #     shift_logits2 = logits2[..., :-1, :].contiguous()
-    #     shift_labels2 = action_labels[..., 1:].contiguous()
-    #     action_ce_loss = F.cross_entropy(
-    #         shift_logits2.view(-1, shift_logits2.size(-1)), 
-    #         shift_labels2.view(-1), 
-    #         ignore_index=-100
-    #     )
-
-    #     return {
-    #         'action_ce_loss': action_ce_loss,
-    #     }
-
-    # def generate_actions_inference(self,
-    #     text_ids_list,
-    #     image_token_ids,
-    #     states,
-    #     reward_sampling_results: Optional[Dict] = None,
-    #     action_tokenizer=None,
-    #     max_new_tokens=80,
-    #     action_vocab_size=2048,
-    #     action_dim=7,
-    #     time_horizon=10,
-    #     do_sample=False,
-    #     auto_sample_reward=False,
-    #     history = None
-    # ):
-    #     """
-    #     用于推理时生成动作序列
-        
-    #     Args:
-    #         text_ids_list: 文本token IDs列表
-    #         image_token_ids: 图像token IDs
-    #         states: 机器人状态
-    #         reward_sampling_results: 奖励采样结果
-    #         action_tokenizer: 动作解码器
-    #         max_new_tokens: 生成的最大token数量
-    #         action_vocab_size: 动作token词表大小
-    #         action_dim: 动作维度
-    #         time_horizon: 生成的动作时间步长
-    #         do_sample: 是否使用采样策略生成
-    #         auto_sample_reward: 是否在reward_sampling_results为None时自动采样奖励
-            
-    #     Returns:
-    #         dict: 包含生成的动作和相关信息
-    #     """
-    #     device = image_token_ids.device
-        
-    #     # 如果没有提供reward_sampling_results且auto_sample_reward为True，则自动调用sample_rewards
-    #     if reward_sampling_results is None and auto_sample_reward:
-    #         reward_sampling_results = self.sample_rewards(
-    #             text_ids_list=text_ids_list,
-    #             image_token_ids=image_token_ids,
-    #             states=states
-    #         )
-        
-        
-    #     # 构建前缀序列
-    #     prefix_inputs = self._prepare_action_prefix(text_ids_list, image_token_ids, states, reward_sampling_results, history)
-        
-    #     # 设置生成配置
-    #     eoa_token_id = self.ids.get('eoa', 151845)  # eoa token id
-    #     last_token_id = self.tokenizer.pad_token_id - 1  # action token结束位置
-        
-    #     # 准备action token约束
-    #     allowed_token_ids = list(range(last_token_id - action_vocab_size, last_token_id + 1)) + [eoa_token_id]
-        
-    #     # 创建logits处理器
-    #     class ActionIDConstraintLogitsProcessor(LogitsProcessor):
-    #         def __init__(self, allowed_token_ids):
-    #             self.allowed_token_ids = allowed_token_ids
-
-    #         def __call__(self, input_ids, scores):
-    #             mask = torch.zeros_like(scores, dtype=torch.bool)
-    #             if mask.ndim == 1:
-    #                 mask[self.allowed_token_ids] = True
-    #             else:
-    #                 mask[:, self.allowed_token_ids] = True
-    #             scores[~mask] = -float("inf")
-    #             return scores
-                
-    #     action_id_processor = ActionIDConstraintLogitsProcessor(allowed_token_ids)
-        
-    #     # 使用自定义的generate方法进行生成
-    #     with torch.no_grad():
-    #         outputs = self.custom_generate(
-    #             inputs_embeds=prefix_inputs['inputs_embeds'],
-    #             attention_mask=prefix_inputs['attention_mask'],
-    #             max_new_tokens=max_new_tokens,
-    #             eos_token_id=eoa_token_id,
-    #             pad_token_id=self.config.pad_token_id,
-    #             do_sample=do_sample,
-    #             logits_processor=action_id_processor,
-    #             return_dict_in_generate=True,
-    #             output_scores=False
-    #         )
-
-    #     action_ids = outputs["sequences"][:, 1:-1]  # 去掉开头填充的的pad token和尾部的eoa
-        
-    #     # 处理action ids得到实际动作值
-    #     last_token_id_tensor = torch.tensor(last_token_id, dtype=action_ids.dtype, device=device)
-    #     processed_outputs = last_token_id_tensor - action_ids
-        
-    #     # 如果提供了action_tokenizer，则解码得到具体动作
-    #     actions = None
-    #     if action_tokenizer is not None:
-    #         # 解码action tokens
-    #         action_outputs = action_tokenizer.decode(processed_outputs, time_horizon=time_horizon, action_dim=action_dim)
-    #         actions = action_outputs[0]  # 取第一个样本的动作序列
-        
-    #     result = {
-    #         'action_ids': processed_outputs,
-    #         'actions': actions,
-    #     }
-        
-    #     # 如果有奖励采样结果，添加到返回值中
-    #     if reward_sampling_results is not None:
-    #         result.update({
-    #             'best_reward_group': reward_sampling_results['best_reward_group'],
-    #             'reward_preds_group_mean': reward_sampling_results.get('reward_preds_group_mean', None)
-    #         })
-            
-    #     return result
-
-    # def _forward_stage2(self,
-    #     text_ids_list: List,
-    #     image_token_ids: torch.LongTensor,
-    #     states: torch.Tensor,
-    #     action_token_ids: Optional[List[torch.Tensor]] = None,
-    #     reward_targets: Optional[torch.Tensor] = None,
-    #     rtg_targets: Optional[torch.Tensor] = None,
-    # ):
-    #     """
-    #     Stage2前向传播（并行奖励采样）
-    #     (荒废)
-    #     Args:
-    #         text_ids_list: 文本ID列表
-    #         image_token_ids: 图像token IDs
-    #         states: 机器人状态
-    #         action_token_ids: 动作token IDs (用于训练/评估)
-    #         reward_targets: 奖励目标
-    #         rtg_targets: RTG目标
-    #     """
-    #     reward_sampling_results = None
-    #     if torch.rand(1).item() < self.p:
-    #         reward_sampling_results = self.sample_rewards(
-    #             text_ids_list=text_ids_list,
-    #             image_token_ids=image_token_ids,
-    #             states=states
-    #         )
-        
-    #     # 第二步：进行动作生成
-    #     action_ce_loss = None
-        
-    #     if action_token_ids is not None:
-    #         action_generation_results = self.generate_actions(
-    #             text_ids_list=text_ids_list,
-    #             image_token_ids=image_token_ids,
-    #             states=states,
-    #             action_token_ids=action_token_ids,
-    #             reward_sampling_results=reward_sampling_results
-    #         )
-            
-    #         action_ce_loss = action_generation_results['action_ce_loss']
-        
-    #     # 合并结果并返回
-    #     result = {
-    #         'action_ce_loss': action_ce_loss,
-    #     }
-        
-    #     # 如果有奖励采样结果，则添加到返回结果中
-    #     if reward_sampling_results is not None:
-    #         result.update({
-    #             'reward_preds_group_mean': reward_sampling_results['reward_preds_group_mean'],
-    #             'best_reward_group': reward_sampling_results['best_reward_group'],
-    #             'noise_norm': reward_sampling_results['noise_norm'],
-    #             'rwd_noise_ratio': reward_sampling_results['rwd_noise_ratio'],
-    #             'rtg_noise_ratio': reward_sampling_results['rtg_noise_ratio'],
-    #             'reward_embedding_norm': reward_sampling_results['reward_embedding_norm'],
-    #         })
-        
-    #     return result
-
-    # def set_mode(self, parallel_mode: bool):
-    #     """
-    #     Args:
-    #         parallel_mode: 如果为True，使用并行reward采样模式（Stage2）；如果为False，使用单个reward模式（Stage1）
-    #     """
-    #     if parallel_mode is not None:
-    #         old_mode = self.parallel_mode
-    #         self.parallel_mode = parallel_mode
-            
-    #         # 如果从非并行模式切换到并行模式，应用并行奖励采样补丁
-    #         if not old_mode and parallel_mode:
-    #             apply_emu3_parallel_patch(self.model)
-    
-    # def set_parallel_reward_config(self, parallel_reward_groups: Optional[int] = None, reward_group_size: Optional[int] = None):
-    #     """
-    #     Args:
-    #         parallel_reward_groups: 并行奖励组数（M）
-    #         reward_group_size: 每组奖励的token数量
-    #     """
-    #     if parallel_reward_groups is not None:
-    #         self.parallel_reward_groups = parallel_reward_groups
-    #     if reward_group_size is not None:
-    #         self.reward_group_size = reward_group_size 
-
-
-    # def _prepare_action_prefix(self, text_ids_list, image_token_ids, states, reward_sampling_results, history = None):
-    #     """
-    #     构建完整的前缀序列，包括文本、图像、状态和最佳奖励组
-        
-    #     Args:
-    #         text_ids_list: 文本token IDs
-    #         image_token_ids: 图像token IDs
-    #         states: 机器人状态
-    #         reward_sampling_results: 奖励采样结果，如果为None则不使用reward
-        
-    #     Returns:
-    #         prefix_inputs: 用于生成的前缀输入，包含inputs_embeds和attention_mask
-    #     """
-    #     device = image_token_ids.device
-        
-    #     # 获取模型内部的嵌入
-    #     static = {k: self.get_input_embeddings()(torch.full((1,1), v, device=device)) 
-    #             for k,v in self.ids.items() if k!='pad'}
-    #     pad_emb = self.get_input_embeddings()(torch.full((1,1), self.ids['pad'], device=device))
-    #     img_embs = self.get_input_embeddings()(image_token_ids)
-    #     #=================Stateless==========
-    #     # state_embs = self.proprio(states)
-        
-    #     # 检查是否有reward信息
-    #     has_reward = reward_sampling_results is not None
-        
-    #     # 构建前缀序列
-    #     prefix_parts = []
-        
-    #     # 1. 文本部分
-    #     text_ids = text_ids_list[0]
-    #     t_emb = self.get_input_embeddings()(text_ids.unsqueeze(0))
-    #     prefix_parts.append(t_emb)
-
-    #     if history is not None:
-    #         for history_time in range(len(history["vision"])):
-    #             prefix_parts += self.get_input_embeddings()(history["vision"][history_time])
-    #             #=================Stateless==========
-    #             # prefix_parts += [static['state_beg'], self.proprio(history["state"][history_time]), static['state_end']]
-    #             if has_reward:
-    #                 prefix_parts += [static['rwd_beg']]
-    #                 #=============Temp:临时修改，rtg已知为纯噪声，推理的时候先去掉他============
-    #                 prefix_parts += [history["reward"][history_time][:,:,:-1].squeeze(1)]
-    #                 prefix_parts += [static['rwd_end']]
-    #             prefix_parts += [static['boa']]
-    #             prefix_parts += self.get_input_embeddings()(history["action"][history_time]).unsqueeze(1)
-    #             prefix_parts += [static['eoa']]
-
-    #     # 2. 图像和状态部分
-    #     K = image_token_ids.shape[1]  # 图像数量
-    #     for j in range(K):
-    #         prefix_parts.append(img_embs[0:1, j])
-    #         #=================Stateless==========
-    #         # prefix_parts += [static['state_beg'], state_embs[0:1,j:j+1,:], static['state_end']]
-        
-    #         # 3. 如果有奖励信息，添加奖励部分          
-    #         if has_reward :
-    #                 # rwd_beg
-    #                 prefix_parts += [static['rwd_beg']]
-    #                 #=============Temp:临时修改，rtg已知为纯噪声，推理的时候先去掉他============
-    #                 selected_reward_hs = reward_sampling_results["critical_segments"][0, j, :-1, :].unsqueeze(0)  # [1, G+1, H]
-    #                 prefix_parts.append(selected_reward_hs)
-    #                 prefix_parts.append(static['rwd_end'])
-            
-            
-    #     # 4. 添加动作开始标记
-    #     prefix_parts.append(static['boa'])
-        
-    #     # 拼接为单个序列
-    #     prefix_embeds = torch.cat(prefix_parts, dim=1)
-        
-    #     # 构建attention_mask
-    #     prefix_len = prefix_embeds.size(1)
-    #     attention_mask = torch.ones((1, prefix_len), dtype=torch.long, device=device)
-        
-    #     return {
-    #         'inputs_embeds': prefix_embeds,
-    #         'attention_mask': attention_mask
-    #     }
-        
-    # def custom_generate(
-    #     self,
-    #     inputs_embeds: torch.Tensor,
-    #     attention_mask: torch.Tensor,
-    #     eos_token_id: Optional[int] = None,
-    #     pad_token_id: Optional[int] = None,
-    #     max_new_tokens: int = 80,
-    #     do_sample: bool = False,
-    #     temperature: float = 1.0,
-    #     top_p: float = 1.0,
-    #     logits_processor: Optional[List[LogitsProcessor]] = None,
-    #     return_dict_in_generate: bool = False,
-    #     output_scores: bool = False,
-    #     **model_kwargs
-    # ):
-    #     """
-    #     基于embeddings的自定义生成方法
-        
-    #     Args:
-    #         inputs_embeds: 输入的embeddings序列 [batch_size, seq_len, hidden_dim]
-    #         attention_mask: 注意力掩码 [batch_size, seq_len]
-    #         max_new_tokens: 最大生成token数
-    #         eos_token_id: 结束标记ID
-    #         pad_token_id: 填充标记ID
-    #         do_sample: 是否使用采样生成
-    #         temperature: 采样温度
-    #         top_p: 采样的累积概率阈值
-    #         logits_processor: logits处理器或处理器列表
-    #         return_dict_in_generate: 是否返回dict形式的输出
-    #         output_scores: 是否输出生成分数
-    #     """
-    #     # 处理默认参数
-    #     if pad_token_id is None:
-    #         pad_token_id = self.config.pad_token_id
-    #     if eos_token_id is None:
-    #         eos_token_id = self.ids.get('eoa', 151845)  # 使用eoa作为结束符
-        
-    #     # 处理logits处理器
-    #     if logits_processor is None:
-    #         logits_processor = []
-    #     elif not isinstance(logits_processor, list):
-    #         logits_processor = [logits_processor]
-        
-    #     device = inputs_embeds.device
-    #     batch_size = inputs_embeds.shape[0]
-    #     vocab_size = self.lm_head.out_features
-    #     hidden_dim = inputs_embeds.shape[2]
-        
-    #     # 初始化结果存储
-    #     input_ids = torch.full((batch_size, 1), pad_token_id, dtype=torch.long, device=device)  # 用于记录生成的token ids
-    #     all_token_ids = input_ids.clone()  # 存储所有生成的token IDs，包括初始填充token
-    #     scores = [] if output_scores else None
-        
-    #     # 获取word embeddings矩阵，用于后续token->embedding转换
-    #     word_embeddings = self.get_input_embeddings().weight
-        
-    #     # 迭代生成max_new_tokens个token
-    #     for i in range(max_new_tokens):
-    #         model_inputs = {
-    #             "inputs_embeds": inputs_embeds,
-    #             "attention_mask": attention_mask,
-    #             "return_dict": True,
-    #         }
-            
-    #         with torch.no_grad():
-    #             outputs = self.model(**model_inputs)
-    #         hidden_states = outputs.last_hidden_state
-            
-    #         next_token_logits = self.lm_head(hidden_states[:, -1, :])
-            
-    #         for processor in logits_processor:
-    #             next_token_logits = processor(input_ids, next_token_logits)
-            
-    #         if do_sample:
-    #             next_token_logits = next_token_logits / temperature
-                
-    #             if top_p < 1.0:
-    #                 sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-    #                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    
-    #                 # 移除概率累积值超过top_p的token
-    #                 sorted_indices_to_remove = cumulative_probs > top_p
-    #                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    #                 sorted_indices_to_remove[..., 0] = 0
-                    
-    #                 # 设置被移除token的logits为-inf
-    #                 for batch_idx in range(batch_size):
-    #                     indices_to_remove = sorted_indices[batch_idx][sorted_indices_to_remove[batch_idx]]
-    #                     next_token_logits[batch_idx, indices_to_remove] = -float("inf")
-                
-    #             probs = F.softmax(next_token_logits, dim=-1)
-    #             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-    #         else:
-    #             next_tokens = torch.argmax(next_token_logits, dim=-1)
-            
-    #         if output_scores:
-    #             scores.append(next_token_logits)
-            
-    #         input_ids = torch.cat([input_ids, next_tokens.unsqueeze(-1)], dim=-1)
-    #         all_token_ids = torch.cat([all_token_ids, next_tokens.unsqueeze(-1)], dim=-1)
-            
-    #         token_embeds = torch.index_select(word_embeddings, 0, next_tokens).unsqueeze(1)  # [batch_size, 1, hidden_dim]
-    #         inputs_embeds = torch.cat([inputs_embeds, token_embeds], dim=1)
-            
-    #         if attention_mask is not None:
-    #             attention_mask = torch.cat([
-    #                 attention_mask, 
-    #                 torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=device)
-    #             ], dim=1)
-            
-    #         if eos_token_id is not None and torch.any(next_tokens == eos_token_id):
-    #             if torch.all(next_tokens == eos_token_id):
-    #                 break
-            
-    #     # 处理输出
-    #     if return_dict_in_generate:
-    #         return {
-    #             "sequences": all_token_ids,  # 包含初始填充token
-    #             "scores": scores if output_scores else None
-    #         }
-    #     else:
-    #         return all_token_ids 
-
-    

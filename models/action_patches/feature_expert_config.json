@@ -1,0 +1,17 @@
+{
+  "action_dim": 7,
+  "dynamic_dim": 4096,
+  "hidden_dim": 2048,
+  "num_layers": 6,
+  "num_heads": 16,
+  "mlp_ratio": 4.0,
+  "drop_rate": 0,
+  "expert_type": "feature_based",
+  "time_horizon": 10,
+  "cross_attention_dim": null,
+  "use_rotary_emb": true,
+  "rope_dim": null,
+  "base_seq_length": 10,
+  "use_reward_conditioning": true,
+  "feature_projection_dim": null
+}

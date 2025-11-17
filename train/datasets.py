@@ -209,7 +209,8 @@ class RewardActionDataset(Dataset):
             'states': states_k,                   # [K, state_dim]
             'reward': reward_tensor,                  # [K,action_frames, reward_dim]
             'rtg': rtg_tensor,                           # [K,action_frames, reward_dim]
-            'action_token_ids': action_ids,       #stage1为空 [K, action_frames, action_dim]
+            'action_token_ids': action_ids,       #stage1为空 [K, action_frames, D*](action_token id不定长的)
+            'actions': action_tensor_grouped
         }
 
 
@@ -223,5 +224,6 @@ def RewardAction_collate(batch: List[Dict[str, Any]]):
     reward = torch.stack([b['reward'] for b in batch], dim=0)
     rtg = torch.stack([b['rtg'] for b in batch], dim=0)
     action_token_ids = [b['action_token_ids'] for b in batch]
+    actions = torch.stack([b['actions'] for b in batch], dim=0)
 
-    return text_ids_list, image_token_ids, states, reward, rtg, action_token_ids
+    return text_ids_list, image_token_ids, states, reward, rtg, action_token_ids,actions
