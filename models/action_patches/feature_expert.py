@@ -3,11 +3,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any, Tuple
-from .dit_blocks import DiTBlock, SinusoidalPositionEmbeddings, ActionRotaryPosEmbed
+from .dit_blocks import DiTBlock, ActionRotaryPosEmbed
 import logging
 import glob
 from .utils import ActionExpertConfig, ExpertType
 import json
+from diffusers.training_utils import (
+    compute_density_for_timestep_sampling,
+    compute_loss_weighting_for_sd3,
+)
+from diffusers.models.normalization import AdaLayerNormSingle
+
+from .scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+import argparse
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +44,11 @@ class FeatureActionExpert(nn.Module):
         use_rotary_emb: bool = True,
         rope_dim: Optional[int] = None,
         base_seq_length: int = 10,
+        # Flow matching weighting scheme parameters
+        weighting_scheme: str = "none",
+        logit_mean: Optional[float] = None,
+        logit_std: Optional[float] = None,
+        mode_scale: Optional[float] = None,
     ):
         super().__init__()
 
@@ -64,14 +77,6 @@ class FeatureActionExpert(nn.Module):
         if feature_projection_dim is None:
             feature_projection_dim = hidden_dim
 
-        # Time embeddings for flow matching
-        self.time_embed = SinusoidalPositionEmbeddings(hidden_dim)
-        self.time_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(hidden_dim * 2, hidden_dim)
-        )
-
         # Feature projection from dynamic model
         input_dim = dynamic_dim
         if use_reward_conditioning:
@@ -93,9 +98,11 @@ class FeatureActionExpert(nn.Module):
                 nn.Linear(dynamic_dim, dynamic_dim)
             )
 
+        # Time embeddings for flow matching
+        self.action_time_embed = AdaLayerNormSingle(self.hidden_dim, use_additional_conditions=False)
+
         # Action embedding
         self.action_proj_in = nn.Linear(action_dim, hidden_dim)
-        self.action_proj_out = nn.Linear(hidden_dim, action_dim)
 
         # Rotary position embeddings
         if use_rotary_emb:
@@ -118,10 +125,21 @@ class FeatureActionExpert(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.final_norm = nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
 
+        self.final_norm = nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
+        self.action_scale_shift_table = nn.Parameter(torch.randn(2, self.hidden_dim) / self.hidden_dim **0.5)
+        self.action_proj_out = nn.Linear(hidden_dim, action_dim)
 
         self._init_weights()
+
+        #=============SD3 STYLE WEIGHTING SCHEME================
+        self.flow_matching_args = argparse.Namespace()
+        self.flow_matching_args.weighting_scheme = weighting_scheme
+        self.flow_matching_args.logit_mean = logit_mean
+        self.flow_matching_args.logit_std = logit_std
+        self.flow_matching_args.mode_scale = mode_scale
+        self.flow_matching_args.scheduler = FlowMatchEulerDiscreteScheduler()
+
 
     def _init_weights(self):
         """Initialize weights using xavier uniform for linear layers"""
@@ -179,15 +197,18 @@ class FeatureActionExpert(nn.Module):
         reward_features: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        _, seq_len = actions.size(0), actions.size(1)
+        batch_size, seq_len = actions.size(0), actions.size(1)
 
         conditioning_features = self.extract_features(visual_features, reward_features)
         conditioning_features = conditioning_features.unsqueeze(1).expand(-1, seq_len, -1)
 
         # Time embeddings
-        time_emb = self.time_embed(timesteps)
-        time_emb = time_emb.to(dtype=actions.dtype)
-        time_emb = self.time_mlp(time_emb)  # [B, hidden_dim]
+        action_temb, action_embedded_timestep = self.action_time_embed(
+            timesteps.flatten(),
+            batch_size=batch_size,
+            hidden_dtype=conditioning_features.dtype,
+            )
+
 
         # Action embeddings
         action_emb = self.action_proj_in(actions)  # [B, seq_len, hidden_dim]
@@ -198,19 +219,23 @@ class FeatureActionExpert(nn.Module):
         # Generate rotary embeddings for action sequence
         rotary_emb = None
         if self.use_rotary_emb:
-            rotary_emb = self.action_rope(conditioned_action_emb, seq_len)
+            rotary_emb = self.action_rope(actions, seq_len)
 
         # Apply DiT blocks
         hidden_states = conditioned_action_emb
         for dit_block in self.dit_blocks:
             hidden_states = dit_block(
                 x=hidden_states,
-                timestep=time_emb,
+                temb=action_temb,
                 attention_mask=attention_mask,
                 rotary_emb=rotary_emb
             )
-
         hidden_states = self.final_norm(hidden_states)
+        action_embedded_timestep = action_embedded_timestep.view(batch_size, seq_len, -1)
+        action_scale_shift_values = self.action_scale_shift_table[None, None] + action_embedded_timestep[:, :, None]
+        action_shift, action_scale = action_scale_shift_values[:,:,0], action_scale_shift_values[:,:,1]
+        hidden_states = hidden_states * (1 + action_scale) + action_shift
+
         flow_prediction = self.action_proj_out(hidden_states)
 
         return flow_prediction
@@ -229,32 +254,46 @@ class FeatureActionExpert(nn.Module):
         reward_features = reward_features.to(dtype=target_actions.dtype)
 
         # Sample random timesteps
-        timesteps = torch.rand(batch_size, device=target_actions.device, dtype=target_actions.dtype)  # Uniformly sample t ∈ [0, 1]
+        action_weights = compute_density_for_timestep_sampling(
+            weighting_scheme=self.flow_matching_args.weighting_scheme,
+            batch_size=batch_size,
+            logit_mean=self.flow_matching_args.logit_mean,
+            logit_std=self.flow_matching_args.logit_std,
+            mode_scale=self.flow_matching_args.mode_scale,
+        ) #[0,1]
+        action_indices = (action_weights * self.flow_matching_args.scheduler.config.num_train_timesteps).long() #[0,1000]
+        scheduler_sigmas = self.flow_matching_args.scheduler.sigmas.clone().to(device=target_actions.device, dtype=target_actions.dtype)
+        action_sigmas = scheduler_sigmas[action_indices] #[0,1]   
+        action_timesteps = (action_sigmas * 1000.0).long() # [B]
+
+
+        action_timesteps = action_timesteps.unsqueeze(-1).repeat(1, seq_len)  # [B, seq_len]
+        action_ss = action_sigmas.reshape(-1, 1, 1).repeat(1, 1, action_dim) #[B,1,action_dim]
+        
 
         # Sample noise (Gaussian)
-        noise = torch.randn_like(target_actions,dtype=target_actions.dtype)
-
-        sigma = timesteps
+        noise = torch.randn_like(target_actions,dtype=target_actions.dtype, device=target_actions.device)
 
         # x(t) = (1-t) * x_1 + t * noise
-        noisy_actions = (1.0 - sigma.view(-1, 1, 1)) * target_actions + sigma.view(-1, 1, 1) * noise
+        noisy_actions = (1.0 - action_ss) * target_actions + action_ss * noise
 
         # v = dx/dt = noise - actions
         target_flow = noise - target_actions
 
         predicted_flow = self.forward(
             actions=noisy_actions,
-            timesteps=timesteps,
+            timesteps=action_timesteps,
             visual_features=visual_features,
             reward_features=reward_features,
         )
+        
 
-        flow_loss = F.mse_loss(predicted_flow, target_flow, reduction='none')
-
-        # Weighting scheme: uniform timesteps, weight by 1/sigma^2 for numerical stability
-        # loss_weights = 1.0 / (sigma.view(-1, 1, 1) ** 2 + 1e-8)
-        # flow_loss = flow_loss * loss_weights
-
+        action_weights = compute_loss_weighting_for_sd3(
+            weighting_scheme=self.flow_matching_args.weighting_scheme, 
+            sigmas=action_sigmas
+        ).reshape(-1, 1, 1).repeat(1, 1, action_dim)
+        flow_loss = action_weights.float() * (predicted_flow.float() - target_flow.float()).pow(2)
+        
         flow_loss = flow_loss.mean()
 
         with torch.no_grad():

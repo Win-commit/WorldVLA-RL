@@ -1,7 +1,7 @@
 #!/bin/bash
 export WANDB_BASE_URL="https://api.bandw.top"
-# API_KEY=bf924aa39303a0d8808787e3777696c3626d4850
-# wandb login $API_KEY
+API_KEY=bf924aa39303a0d8808787e3777696c3626d4850
+wandb login $API_KEY
 
 WORLD_SIZE=${WORLD_SIZE:-1}
 RANK=${RANK:-0}
@@ -50,7 +50,7 @@ torchrun \
     --max_position_embeddings 6400 \
     --eval_strategy no \
     --seed 42 \
-    --report_to "none" \
+    --report_to "wandb" \
     --logging_steps 8 \
     --gradient_checkpointing True \
     --gradient_accumulation_steps 2 \

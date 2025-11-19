@@ -5,24 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SinusoidalPositionEmbeddings(nn.Module):
-    """Sinusoidal time embeddings for flow matching"""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, time: torch.Tensor) -> torch.Tensor:
-        device = time.device
-        dtype = time.dtype  # Preserve input dtype
-        half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
-
-
 class DiTBlock(nn.Module):
     """
     DiT (Diffusion Transformer) Block for action expert
@@ -85,15 +67,12 @@ class DiTBlock(nn.Module):
         )
 
         # Time embedding layers
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size)
-        )
+        self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size**0.5)
 
     def forward(
         self,
         x: torch.Tensor,
-        timestep: torch.Tensor,
+        temb: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         cross_attention_mask: Optional[torch.Tensor] = None,
@@ -108,15 +87,16 @@ class DiTBlock(nn.Module):
             cross_attention_mask: Cross-attention mask [B, seq_len, ctx_len]
             rotary_emb: Tuple of (cos, sin) for rotary position embedding [B, seq_len, dim] or [1, seq_len, dim]
         """
-
+        batch_size = x.shape[0]
         # AdaLN modulation
-        timestep = timestep.to(dtype=x.dtype)  # Ensure timestep has same dtype as x
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(timestep).chunk(6, dim=-1)
-
+        temb = temb.to(dtype=x.dtype)  # Ensure timestep has same dtype as x
+        num_ada_params = self.scale_shift_table.shape[0]
+        ada_values = self.scale_shift_table[None, None] + temb.reshape(batch_size, -1, num_ada_params, self.hidden_size)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
         # Self-attention (only for "self" and "both")
         if self.attention_type in ["self", "both"]:
             x_norm = self.norm1(x)
-            x_norm = x_norm * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+            x_norm = x_norm * (1 + scale_msa) + shift_msa
 
             # Prepare query/key/value for attention with qk-norm
             query = self.norm_q(self.attn_query(x_norm))
@@ -140,7 +120,7 @@ class DiTBlock(nn.Module):
             attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
             attn_output = self.attn_output(attn_output)
 
-            x = x + gate_msa.unsqueeze(1) * attn_output
+            x = x + gate_msa * attn_output
 
         # Cross-attention (only for "cross" and "both")
         if self.attention_type in ["cross", "both"] and encoder_hidden_states is not None:
@@ -165,18 +145,15 @@ class DiTBlock(nn.Module):
 
         # MLP with AdaLN
         x_norm = self.norm2(x)
-        x_norm = x_norm * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-
+        x_norm = x_norm * (1 + scale_mlp) + shift_mlp
         mlp_output = self.mlp(x_norm)
-        x = x + gate_mlp.unsqueeze(1) * mlp_output
-
+        x = x + gate_mlp * mlp_output
         return x
 
 
 class ActionRotaryPosEmbed(nn.Module):
     """
     Rotary Position Embedding for actions
-    Based on Genie-Envisioner implementation
     """
 
     def __init__(
@@ -191,8 +168,6 @@ class ActionRotaryPosEmbed(nn.Module):
         self.theta = theta
 
     def forward(self, hidden_states: torch.Tensor, seq_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = hidden_states.size(0)
-        dim = hidden_states.size(-1)
         dtype = hidden_states.dtype 
 
         grid = torch.arange(seq_length, dtype=dtype, device=hidden_states.device).unsqueeze(0)
@@ -204,7 +179,7 @@ class ActionRotaryPosEmbed(nn.Module):
         freqs = self.theta ** torch.linspace(
             math.log(start, self.theta),
             math.log(end, self.theta),
-            dim // 2,
+            self.dim // 2,
             device=hidden_states.device,
             dtype=dtype,
         )
@@ -214,15 +189,11 @@ class ActionRotaryPosEmbed(nn.Module):
         cos_freqs = freqs.cos().repeat_interleave(2, dim=-1)
         sin_freqs = freqs.sin().repeat_interleave(2, dim=-1)
 
-        if dim % 2 != 0:
-            cos_padding = torch.ones_like(cos_freqs[:, :, :dim % 2])
-            sin_padding = torch.zeros_like(sin_freqs[:, :, :dim % 2])
+        if self.dim % 2 != 0:
+            cos_padding = torch.ones_like(cos_freqs[:, :, :self.dim % 2])
+            sin_padding = torch.zeros_like(sin_freqs[:, :, :self.dim % 2])
             cos_freqs = torch.cat([cos_padding, cos_freqs], dim=-1)
             sin_freqs = torch.cat([sin_padding, sin_freqs], dim=-1)
-
-        # Expand for batch dimension
-        cos_freqs = cos_freqs.repeat(batch_size, 1, 1)
-        sin_freqs = sin_freqs.repeat(batch_size, 1, 1)
 
         return cos_freqs, sin_freqs
 
@@ -255,6 +226,7 @@ def apply_rotary_emb(
     x_real = x_reshaped[..., 0]  # [B, S, H//2]
     x_imag = x_reshaped[..., 1]  # [B, S, H//2]
 
+
     # Reshape cos/sin
     cos = cos.unflatten(-1, (-1, 2))  # [B, S, H//2, 2]
     sin = sin.unflatten(-1, (-1, 2))  # [B, S, H//2, 2]
@@ -267,5 +239,4 @@ def apply_rotary_emb(
 
     # Flatten the last two dimensions
     x_rotated = x_rotated.flatten(-2)
-
     return x_rotated.type_as(x)

@@ -2,12 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any, Tuple, List
-from .dit_blocks import DiTBlock, SinusoidalPositionEmbeddings, ActionRotaryPosEmbed
+from .dit_blocks import DiTBlock, ActionRotaryPosEmbed
 import os
 import logging
 from .utils import ActionExpertConfig, ExpertType
 logger = logging.getLogger(__name__)
-
+from diffusers.training_utils import (
+    compute_density_for_timestep_sampling,
+    compute_loss_weighting_for_sd3,
+)
+from diffusers.models.normalization import AdaLayerNormSingle
+from .scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+import argparse
 
 class CrossAttentionActionExpert(nn.Module):
     """
@@ -33,7 +39,12 @@ class CrossAttentionActionExpert(nn.Module):
         rope_dim: Optional[int] = None,
         base_seq_length: int = 100,
         # Reward conditioning
-        use_reward_conditioning: bool = True
+        use_reward_conditioning: bool = True,
+        # Flow matching weighting scheme parameters
+        weighting_scheme: str = "none",
+        logit_mean: Optional[float] = None,
+        logit_std: Optional[float] = None,
+        mode_scale: Optional[float] = None,
     ):
         super().__init__()
 
@@ -63,16 +74,11 @@ class CrossAttentionActionExpert(nn.Module):
         )
 
         # Time embeddings for flow matching
-        self.time_embed = SinusoidalPositionEmbeddings(hidden_dim)
-        self.time_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(hidden_dim * 2, hidden_dim)
-        )
+        self.action_time_embed = AdaLayerNormSingle(self.hidden_dim, use_additional_conditions=False)
 
         # Action embedding
         self.action_proj_in = nn.Linear(action_dim, hidden_dim)
-        self.action_proj_out = nn.Linear(hidden_dim, action_dim)
+       
 
       
         # Rotary position embeddings
@@ -117,6 +123,11 @@ class CrossAttentionActionExpert(nn.Module):
         # Final layer norm
         self.final_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
 
+        self.action_scale_shift_table = nn.Parameter(torch.randn(2, self.hidden_dim) / self.hidden_dim **0.5)
+
+        self.action_proj_out = nn.Linear(hidden_dim, action_dim)
+
+
         # Context projection for dynamic model features
         self.context_proj = nn.Sequential(
             nn.Linear(cross_attention_dim, cross_attention_dim),
@@ -127,6 +138,15 @@ class CrossAttentionActionExpert(nn.Module):
 
         # Initialize weights
         self._init_weights()
+
+        #=============SD3 STYLE WEIGHTING SCHEME================
+        self.flow_matching_args = argparse.Namespace()
+        self.flow_matching_args.weighting_scheme = weighting_scheme
+        self.flow_matching_args.logit_mean = logit_mean
+        self.flow_matching_args.logit_std = logit_std
+        self.flow_matching_args.mode_scale = mode_scale
+        self.flow_matching_args.scheduler = FlowMatchEulerDiscreteScheduler()
+
 
     def _init_weights(self):
         """Initialize weights using xavier uniform for linear layers"""
@@ -229,8 +249,11 @@ class CrossAttentionActionExpert(nn.Module):
         )
 
         # Time embeddings
-        time_emb = self.time_embed(timesteps)
-        time_emb = self.time_mlp(time_emb)  # [B, hidden_dim]
+        action_temb, action_embedded_timestep = self.action_time_embed(
+            timesteps.flatten(),
+            batch_size=batch_size,
+            hidden_dtype=conditioning_features.dtype,
+        )
 
         # Action embeddings with learnable tokens
         action_emb = self.action_proj_in(actions)  # [B, seq_len, hidden_dim]
@@ -251,13 +274,18 @@ class CrossAttentionActionExpert(nn.Module):
             
             hidden_states = dit_block(
                 x=hidden_states,
-                timestep=time_emb,
+                temb=action_temb,
                 encoder_hidden_states=dynamic_context,
                 rotary_emb=rotary_emb
             )
 
         # Final norm and projection
         hidden_states = self.final_norm(hidden_states)
+
+        action_scale_shift_values = self.action_scale_shift_table[None, None] + action_embedded_timestep[:, :, None]
+        action_shift, action_scale = action_scale_shift_values[:,:,0], action_scale_shift_values[:,:,1]
+        hidden_states = hidden_states * (1 + action_scale) + action_shift
+
         flow_prediction = self.action_proj_out(hidden_states)
 
         return flow_prediction
@@ -292,15 +320,26 @@ class CrossAttentionActionExpert(nn.Module):
             reward_features = reward_features.to(dtype=target_actions.dtype)
 
         # Sample random timesteps
-        timesteps = torch.rand(batch_size, device=target_actions.device, dtype=target_actions.dtype)
+        action_weights = compute_density_for_timestep_sampling(
+            weighting_scheme=self.flow_matching_args.weighting_scheme,
+            batch_size=batch_size,
+            logit_mean=self.flow_matching_args.logit_mean,
+            logit_std=self.flow_matching_args.logit_std,
+            mode_scale=self.flow_matching_args.mode_scale,
+        ) #[0,1]
+        action_indices = (action_weights * self.flow_matching_args.scheduler.config.num_train_timesteps).long() #[0,1000]
+        scheduler_sigmas = self.flow_matching_args.scheduler.sigmas.clone().to(device=target_actions.device, dtype=target_actions.dtype)
+        action_sigmas = scheduler_sigmas[action_indices] #[0,1]
+        action_timesteps = (action_sigmas * 1000.0).long() # [B]
+        action_timesteps = action_timesteps.unsqueeze(-1).repeat(1, seq_len)  # [B, seq_len]
+        action_ss = action_sigmas.reshape(-1, 1, 1).repeat(1, 1, action_dim) #[B,1,action_dim]
 
         # Sample noise (Gaussian)
         noise = torch.randn_like(target_actions, dtype=target_actions.dtype)
 
-        sigma = timesteps  # sigma ∈ [0, 1]
 
         # x(t) = (1-t) * x_data + t * noise
-        noisy_actions = (1.0 - sigma.view(-1, 1, 1)) * target_actions + sigma.view(-1, 1, 1) * noise
+        noisy_actions = (1.0 - action_ss) * target_actions + action_ss * noise
 
         # Compute target flow (velocity field)
         # v = dx/dt = noise - actions
@@ -309,20 +348,18 @@ class CrossAttentionActionExpert(nn.Module):
         # Predict flow
         predicted_flow = self.forward(
             actions=noisy_actions,
-            timesteps=timesteps,
+            timesteps=action_timesteps,
             dynamic_hidden_states=dynamic_hidden_states,
             visual_features=visual_features,
             reward_features=reward_features
         )
 
-        # Compute MSE loss with SD3-style weighting
-        flow_loss = F.mse_loss(predicted_flow, target_flow, reduction='none')
-
-        # Apply SD3-style loss weighting
-        # Weighting scheme: uniform timesteps, weight by 1/sigma^2 for numerical stability
-        loss_weights = 1.0 / (sigma.view(-1, 1, 1) ** 2 + 1e-8)
-        flow_loss = flow_loss * loss_weights
-
+        action_weights = compute_loss_weighting_for_sd3(
+            weighting_scheme=self.flow_matching_args.weighting_scheme, 
+            sigmas=action_sigmas
+        ).reshape(-1, 1, 1).repeat(1, 1, action_dim)
+        flow_loss = action_weights.float() * (predicted_flow.float() - target_flow.float()).pow(2)
+        
         flow_loss = flow_loss.mean()
 
         # Additional metrics
