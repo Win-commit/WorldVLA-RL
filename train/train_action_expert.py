@@ -11,17 +11,16 @@ from transformers import (
 )
 import logging
 import pathlib
-from train.datasets import RewardActionDataset, RewardAction_collate
+from datasets import RewardActionDataset, RewardAction_collate
 # Import our action expert modules
 from models.action_patches import (
     ActionExpertConfig,
     ExpertType,
     create_action_expert,
 )
-
-# Import existing modules for dynamic model
-from models.univla_rl_unified import Emu3UnifiedRewardModel
 from models.Emu3.emu3.mllm.tokenization_emu3 import Emu3Tokenizer
+
+from models.policy import OurPolicy
 
 # Set up logging
 logging.basicConfig(
@@ -100,13 +99,9 @@ class ActionExpertTrainer(Trainer):
 
     def __init__(
         self,
-        dynamic_model: Optional[Emu3UnifiedRewardModel] = None,
         **kwargs
     ):
         super().__init__(**kwargs)
-        self.dynamic_model = dynamic_model
-
-        self.model.train()
 
     def get_train_dataloader(self):
         """Override to use custom collate function"""
@@ -168,24 +163,17 @@ class ActionExpertTrainer(Trainer):
         #[B,K(K=1),seq_len,action_dim] -> [B,action_frames,action_dim]
         target_actions = target_actions.to(device, dtype=dtype, non_blocking=True).squeeze(1)
 
-        reward_sampling_results = self.dynamic_model.sample_rewards(
+        loss_dict = model(
             text_ids_list=text_ids_list,
             image_token_ids=image_token_ids,
-            states=states
+            states=states,
+            target_actions = target_actions
         )
-
-        loss_dict = model.compute_flow_loss(
-                reward_sampling_results = reward_sampling_results,
-                target_actions=target_actions
-            )
-       
-
-        loss = loss_dict['loss']
-
-        # Log additional metrics
+        loss = loss_dict["loss"]
         if hasattr(self, 'log') and self.state.is_world_process_zero:
             log_dict = {
                 "train/flow_loss": loss_dict['flow_loss'].item(),
+                "train/target_flow_norm": loss_dict['target_flow_norm'].item(),
                 "train/predicted_flow_norm": loss_dict['predicted_flow_norm'].item()
             }
 
@@ -196,54 +184,21 @@ class ActionExpertTrainer(Trainer):
 
 
 class WandbLoggingCallback(TrainerCallback):
-    """Custom callback for wandb logging"""
-
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
         if logs is not None and state.is_world_process_zero:
             # Log to wandb
             wandb.log(logs, step=state.global_step)
 
 
-def load_dynamic_model(model_args, tokenizer: Emu3Tokenizer) -> Emu3UnifiedRewardModel:
-    """Load and freeze the dynamic model"""
-    logger.info(f"Loading frozen dynamic model from {model_args.dynamic_model_path}")
-
-    from models.Emu3.emu3.mllm.configuration_emu3 import Emu3RewardConfig
-    config = Emu3RewardConfig.from_pretrained(model_args.dynamic_model_path)
-
-    model = Emu3UnifiedRewardModel.from_pretrained(
-        model_args.dynamic_model_path,
-        config=config,
-        tokenizer=tokenizer,
-        trust_remote_code=True,
-        parallel_mode=model_args.parallel_mode,
-        parallel_reward_groups=model_args.parallel_reward_groups,
-        reward_group_size=model_args.reward_group_size,
-        gamma=model_args.gamma,
-        noise_factor=model_args.noise_factor,
-        attn_implementation= 'eager',
-        torch_dtype=torch.bfloat16
-    )
-
-    if model_args.freeze_dynamic_model:
-        for param in model.parameters():
-            param.requires_grad = False
-        model.eval()
-
-    return model
-
-
 def main():
-    """Main training function"""
-    # Parse arguments
+
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Create output directory if it doesn't exist
     if not os.path.exists(training_args.output_dir):
         os.makedirs(training_args.output_dir, exist_ok=True)
 
-    # Initialize wandb
+
     if training_args.report_to and "wandb" in training_args.report_to:
         if training_args.resume_from_checkpoint:
             run_id = (pathlib.Path(training_args.output_dir).resolve() / "wandb_id.txt").read_text().strip()
@@ -266,50 +221,45 @@ def main():
             )
             (pathlib.Path(training_args.output_dir).resolve() / "wandb_id.txt").write_text(wandb.run.id)
 
-    # Create action expert config
+
     assert model_args.action_expert_config is not None, "Please provide a valid action expert config path"
     action_config = ActionExpertConfig.from_json(model_args.action_expert_config)
-
-    logger.info(f"Action expert config: {action_config.to_dict()}")
-
-    # Create action expert model
-    action_expert = create_action_expert(
-        action_config,
-        model_path=model_args.action_expert_path if model_args.action_expert_path and os.path.exists(model_args.action_expert_path) else None,
-        map_location=training_args.device
-    )
-    action_expert.to(training_args.device, dtype=torch.bfloat16)
-
-    logger.info(f"Created action expert with {sum(p.numel() for p in action_expert.parameters())} parameters")
-
+    
     tokenizer = Emu3Tokenizer.from_pretrained(
-        model_args.dynamic_model_path,
-        model_max_length=model_args.max_position_embeddings or 6400,
-        trust_remote_code=True,
-    )
+            model_args.dynamic_model_path,
+            model_max_length=model_args.max_position_embeddings or 6400,
+            trust_remote_code=True,
+        )
 
+    policy = OurPolicy(dynamic_model_path = model_args.dynamic_model_path,
+                       tokenizer = tokenizer,
+                       parallel_reward_groups = model_args.parallel_reward_groups,
+                       reward_group_size = model_args.reward_group_size,
+                       gamma = model_args.gamma,
+                       noise_factor = model_args.noise_factor,
+                       action_config = action_config,
+                       action_expert_path = model_args.action_expert_path if model_args.action_expert_path and os.path.exists(model_args.action_expert_path) else None,
+                       device = training_args.device
+                       )
 
-    dynamic_model = load_dynamic_model(model_args, tokenizer)
+    policy.frozen_dynamic_world()
 
-    # Create dataset
     train_dataset = RewardActionDataset(data_args, tokenizer, stage=model_args.stage)
 
-    # Create trainer
+
     trainer = ActionExpertTrainer(
-        model=action_expert,
-        dynamic_model=dynamic_model,
+        model=policy,
         args=training_args,
         train_dataset=train_dataset,
         callbacks=[WandbLoggingCallback()] if training_args.report_to == "wandb" else None,
     )
 
-    # Train
+
     if training_args.resume_from_checkpoint:
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     else:
         trainer.train()
 
-    # Save final model
     trainer.save_model()
     trainer.save_state()
 

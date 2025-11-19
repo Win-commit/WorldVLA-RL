@@ -4,7 +4,6 @@ from .attention_expert import CrossAttentionActionExpert
 from .utils import (
     ActionExpertConfig,
     ExpertType,
-    ActionType,
     create_action_expert,
 )
 

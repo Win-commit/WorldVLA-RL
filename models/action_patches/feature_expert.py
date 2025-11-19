@@ -1,18 +1,13 @@
 import os
-import sys
-# Add the parent directory to path for testing
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.insert(0, parent_dir)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any, Tuple
-from dit_blocks import DiTBlock, SinusoidalPositionEmbeddings, ActionRotaryPosEmbed
+from .dit_blocks import DiTBlock, SinusoidalPositionEmbeddings, ActionRotaryPosEmbed
 import logging
 import glob
-
+from .utils import ActionExpertConfig, ExpertType
+import json
 logger = logging.getLogger(__name__)
 
 
@@ -22,7 +17,6 @@ class FeatureActionExpert(nn.Module):
 
     This approach extracts features from the dynamic model and uses them as conditioning
     for the flow matching process to generate actions.
-    525M
     """
 
     def __init__(
@@ -32,7 +26,7 @@ class FeatureActionExpert(nn.Module):
         hidden_dim: int = 2048,
         num_layers: int = 6,
         num_heads: int = 16,
-        mlp_ratio: float = 4.0,
+        mlp_ratio: float = 1.0,
         drop_rate: float = 0.1,
         time_horizon: int = 10,
         # Feature projection parameters
@@ -49,8 +43,24 @@ class FeatureActionExpert(nn.Module):
         self.time_horizon = time_horizon
         self.use_reward_conditioning = use_reward_conditioning
         self.use_rotary_emb = use_rotary_emb
+        self.hidden_dim = hidden_dim
 
-        # Feature projection dimensions
+        self.config = ActionExpertConfig(
+            action_dim=action_dim,
+            dynamic_dim=dynamic_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            drop_rate=drop_rate,
+            time_horizon=time_horizon,
+            use_reward_conditioning=use_reward_conditioning,
+            use_rotary_emb=use_rotary_emb,
+            feature_projection_dim=feature_projection_dim,
+            expert_type=ExpertType.FEATURE_BASED,
+        )
+
+
         if feature_projection_dim is None:
             feature_projection_dim = hidden_dim
 
@@ -108,7 +118,7 @@ class FeatureActionExpert(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.final_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+        self.final_norm = nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
 
 
         self._init_weights()
@@ -169,17 +179,6 @@ class FeatureActionExpert(nn.Module):
         reward_features: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            actions: Noisy actions [B, seq_len, action_dim]
-            timesteps: Timesteps for flow matching [B,]
-            visual_features: Visual features from dynamic model [B, visual_dim]
-            reward_features: Reward features from dynamic model [B, reward_dim] or [B, S+1, visual_dim]
-            attention_mask: Attention mask [B, seq_len]
-
-        Returns:
-            Predicted flow [B, seq_len, action_dim]
-        """
         _, seq_len = actions.size(0), actions.size(1)
 
         conditioning_features = self.extract_features(visual_features, reward_features)
@@ -221,18 +220,13 @@ class FeatureActionExpert(nn.Module):
         reward_sampling_results: Dict,
         target_actions: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            reward_sampling_results: Dictionary containing sampled rewards from dynamic model
-            target_actions: Target actions [B, seq_len, action_dim]
-        Returns:
-            Dictionary with loss and metrics
-        """
         batch_size, seq_len, action_dim = target_actions.shape
 
         visual_features = reward_sampling_results['last_hidden_states'][torch.arange(batch_size), reward_sampling_results["last_image_token_pos"].squeeze(-1)]  # [B, visual_dim]
+        visual_features = visual_features.to(dtype=target_actions.dtype)
 
         reward_features = reward_sampling_results["critical_segments"].squeeze(1)[:,:-1,:]  #[B, S, visual_dim] remove rtg represntation
+        reward_features = reward_features.to(dtype=target_actions.dtype)
 
         # Sample random timesteps
         timesteps = torch.rand(batch_size, device=target_actions.device, dtype=target_actions.dtype)  # Uniformly sample t ∈ [0, 1]
@@ -258,13 +252,14 @@ class FeatureActionExpert(nn.Module):
         flow_loss = F.mse_loss(predicted_flow, target_flow, reduction='none')
 
         # Weighting scheme: uniform timesteps, weight by 1/sigma^2 for numerical stability
-        loss_weights = 1.0 / (sigma.view(-1, 1, 1) ** 2 + 1e-8)
-        flow_loss = flow_loss * loss_weights
+        # loss_weights = 1.0 / (sigma.view(-1, 1, 1) ** 2 + 1e-8)
+        # flow_loss = flow_loss * loss_weights
 
         flow_loss = flow_loss.mean()
 
         with torch.no_grad():
             flow_magnitude = predicted_flow.norm(dim=-1).mean()
+
 
         return {
             'loss': flow_loss,
@@ -333,6 +328,7 @@ class FeatureActionExpert(nn.Module):
 
     #     return actions
 
+
     def get_trainable_parameters(self):
         """Get parameters that should be trained (excluding frozen components)"""
         return [p for _, p in self.named_parameters() if p.requires_grad]
@@ -345,7 +341,7 @@ class FeatureActionExpert(nn.Module):
         **kwargs
     ) -> "FeatureActionExpert":
         if os.path.isdir(model_path):
-            
+
             checkpoint_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
             checkpoint_files.extend(glob.glob(os.path.join(model_path, "model.safetensors")))
             if checkpoint_files:
@@ -383,6 +379,20 @@ class FeatureActionExpert(nn.Module):
             # Use default config
             instance = cls(**kwargs)
 
+        instance.config = ActionExpertConfig(
+            action_dim=instance.action_dim,
+            dynamic_dim=getattr(instance, 'dynamic_dim', 4096),
+            hidden_dim=instance.hidden_dim,
+            num_layers=len(instance.dit_blocks) if hasattr(instance, 'dit_blocks') else 6,
+            num_heads=instance.dit_blocks[0].num_heads if hasattr(instance, 'dit_blocks') and instance.dit_blocks else 16,
+            mlp_ratio=instance.dit_blocks[0].mlp_ratio if hasattr(instance, 'dit_blocks') and instance.dit_blocks else 4.0,
+            drop_rate=instance.dit_blocks[0].drop_rate if hasattr(instance, 'dit_blocks') and instance.dit_blocks else 0.1,
+            time_horizon=instance.time_horizon,
+            use_reward_conditioning=instance.use_reward_conditioning,
+            use_rotary_emb=instance.use_rotary_emb,
+            expert_type=ExpertType.FEATURE_BASED,
+        )
+
         # Load weights
         missing_keys, unexpected_keys = instance.load_state_dict(state_dict, strict=False)
 
@@ -419,7 +429,6 @@ class FeatureActionExpert(nn.Module):
         }
 
         config_path = os.path.join(save_directory, "config.json")
-        import json
         with open(config_path, 'w') as f:
             json.dump(config_dict, f, indent=2)
 

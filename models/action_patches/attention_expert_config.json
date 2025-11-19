@@ -6,7 +6,7 @@
   "num_heads": 16,
   "mlp_ratio": 1.0,
   "drop_rate": 0,
-  "expert_type": "feature_based",
+  "expert_type": "cross_attention",
   "time_horizon": 10,
   "cross_attention_dim": null,
   "use_rotary_emb": true,

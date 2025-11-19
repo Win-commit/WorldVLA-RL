@@ -13,7 +13,7 @@ TrainerCallback
 from models.univla_rl_unified import Emu3UnifiedRewardModel
 from models.Emu3.emu3.mllm.tokenization_emu3 import Emu3Tokenizer
 from models.Emu3.emu3.mllm.configuration_emu3 import Emu3Config,Emu3RewardConfig
-from train.datasets import RewardActionDataset, RewardAction_collate
+from datasets import RewardActionDataset, RewardAction_collate
 import pathlib
 os.environ["WANDB_BASE_URL"] = "https://api.bandw.top"
 

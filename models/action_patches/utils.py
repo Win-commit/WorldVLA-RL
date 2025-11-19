@@ -57,6 +57,11 @@ class ActionExpertConfig:
         assert self.action_dim > 0, "action_dim must be positive"
         assert self.hidden_dim % self.num_heads == 0, "hidden_dim must be divisible by num_heads"
 
+    @property
+    def hidden_size(self) -> int:
+        """Alias for hidden_dim to match HuggingFace model convention"""
+        return self.hidden_dim
+
 
     def to_dict(self) -> Dict[str, Any]:
         result = {}
@@ -148,7 +153,6 @@ def create_action_expert(config: ActionExpertConfig, model_path: Optional[str] =
 
 def save_config(config: ActionExpertConfig, filepath: str):
     """Save configuration to file"""
-    import json
     config_dict = config.to_dict()
     with open(filepath, 'w') as f:
         json.dump(config_dict, f, indent=2, default=str)
@@ -156,7 +160,6 @@ def save_config(config: ActionExpertConfig, filepath: str):
 
 def load_config(filepath: str) -> ActionExpertConfig:
     """Load configuration from file"""
-    import json
     with open(filepath, 'r') as f:
         config_dict = json.load(f)
     return ActionExpertConfig.from_dict(config_dict)

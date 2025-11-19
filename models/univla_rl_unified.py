@@ -10,10 +10,6 @@ import numpy as np
 from pdb import set_trace
 from typing import Any, Callable, Dict, Optional, Protocol, Tuple, Union, List
 from torch.cuda.amp import autocast
-
-# 添加分布式训练相关导入
-import torch.distributed as dist
-
 from models.reward_heads import ValueEncoder, ValueDecoder, reparameterize, vae_loss
 from models.Emu3.emu3.mllm.modeling_emu3 import Emu3PreTrainedModel, Emu3Model
 from models.Emu3.emu3.mllm.tokenization_emu3 import Emu3Tokenizer
@@ -22,6 +18,8 @@ from models.Projectors import ProprioProjector
 from models.emu3_parallel_patch import apply_emu3_parallel_patch, generate_parallel_reward_attention_mask
 from transformers import LogitsProcessor, GenerationConfig
 from transformers.cache_utils import Cache
+
+
 class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -357,7 +355,8 @@ class Emu3UnifiedRewardModel(Emu3PreTrainedModel):
         B, K, L_img = image_token_ids.shape
         device = image_token_ids.device
         max_len = self.tokenizer.model_max_length
-        
+
+
         # prepare embeddings
         static = {k: self.get_input_embeddings()(torch.full((1,1), v, device=device)) for k,v in self.ids.items() if k!='pad'}
         pad_emb = self.get_input_embeddings()(torch.full((1,1), self.ids['pad'], device=device))

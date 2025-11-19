@@ -1,7 +1,7 @@
 #!/bin/bash
 export WANDB_BASE_URL="https://api.bandw.top"
-API_KEY=bf924aa39303a0d8808787e3777696c3626d4850
-wandb login $API_KEY
+# API_KEY=bf924aa39303a0d8808787e3777696c3626d4850
+# wandb login $API_KEY
 
 WORLD_SIZE=${WORLD_SIZE:-1}
 RANK=${RANK:-0}
@@ -26,12 +26,13 @@ torchrun \
     train/train_action_expert.py \
     --dynamic_model_path /liujinxin/zhy/ICLR2026/logs/discard/after_VAE/STAGE1_BalanceLoss_StateNorm_ValueChunk_CVAE_EMA/checkpoint-8000 \
     ${STAGE_ARGS} \
-    --action_expert_config /liujinxin/zhy/ICLR2026/models/action_patches/feature_expert_config.json \ 
-    --output_dir "logs/"${EXP_NAME} \
+    --deepspeed configs/deepspeed/zero3_offload.json \
+    --action_expert_config /liujinxin/zhy/ICLR2026/models/action_patches/feature_expert_config.json \
+    --output_dir logs/${EXP_NAME} \
     --learning_rate 5e-5 \
-    --weight_decay 0.1 \
+    --weight_decay 1e-5 \
     --min_learning_rate 5e-5 \
-    --max_grad_norm 5.0 \
+    --max_grad_norm 1.0 \
     --adam_beta1 0.9 \
     --adam_beta2 0.95 \
     --adam_epsilon 1e-6 \
@@ -42,17 +43,17 @@ torchrun \
     --dataloader_num_workers 12 \
     --lr_scheduler_type "cosine_with_min_lr" \
     --warmup_steps 5000 \
-    --per_device_train_batch_size 6 \
+    --per_device_train_batch_size 4 \
     --frames ${FRAMES} \
     --action_frames 10 \
     --action_tokenizer_path "/liujinxin/zhy/ICLR2026/pretrain/fast" \
     --max_position_embeddings 6400 \
     --eval_strategy no \
     --seed 42 \
-    --report_to "wandb" \
+    --report_to "none" \
     --logging_steps 8 \
     --gradient_checkpointing True \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps 2 \
     --save_steps 1000 \
     --save_strategy "steps" \
     --remove_unused_columns False \

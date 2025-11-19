@@ -42,29 +42,37 @@ class DiTBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.drop_rate = drop_rate
         self.mlp_ratio = mlp_ratio
         self.attention_type = attention_type
         self.head_dim = hidden_size // num_heads
 
         # Layer normalization
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = nn.RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 =nn.RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
         if attention_type in ["cross", "both"] and cross_attention_dim is not None:
-            self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.norm_cross = nn.RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
-        # Self-attention components (split into q, k, v, out)
-        self.attn_query = nn.Linear(hidden_size, hidden_size)
-        self.attn_key = nn.Linear(hidden_size, hidden_size)
-        self.attn_value = nn.Linear(hidden_size, hidden_size)
-        self.attn_output = nn.Linear(hidden_size, hidden_size)
+        if attention_type in ["self", "both"]:
+            # Self-attention components (split into q, k, v, out)
+            self.attn_query = nn.Linear(hidden_size, hidden_size, bias=True)
+            self.attn_key = nn.Linear(hidden_size, hidden_size, bias=True)
+            self.attn_value = nn.Linear(hidden_size, hidden_size, bias=True)
+            self.attn_output = nn.Linear(hidden_size, hidden_size, bias=True)
+            # RMSNorm for query and key (QK-Norm)
+            self.norm_q = nn.RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.norm_k = nn.RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
         # Cross-attention (if needed)
         if attention_type in ["cross", "both"] and cross_attention_dim is not None:
-            self.cross_attn_query = nn.Linear(hidden_size, hidden_size)
-            self.cross_attn_key = nn.Linear(cross_attention_dim, hidden_size)
-            self.cross_attn_value = nn.Linear(cross_attention_dim, hidden_size)
-            self.cross_attn_output = nn.Linear(hidden_size, hidden_size)
+            self.cross_attn_query = nn.Linear(hidden_size, hidden_size, bias=True)
+            self.cross_attn_key = nn.Linear(cross_attention_dim, hidden_size, bias=True)
+            self.cross_attn_value = nn.Linear(cross_attention_dim, hidden_size, bias=True)
+            self.cross_attn_output = nn.Linear(hidden_size, hidden_size, bias=True)
+            # RMSNorm for cross-attention query and key
+            self.norm_cross_q = nn.RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.norm_cross_k = nn.RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
         # MLP
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -110,9 +118,9 @@ class DiTBlock(nn.Module):
             x_norm = self.norm1(x)
             x_norm = x_norm * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
 
-            # Prepare query/key/value for attention
-            query = self.attn_query(x_norm)
-            key = self.attn_key(x_norm)
+            # Prepare query/key/value for attention with qk-norm
+            query = self.norm_q(self.attn_query(x_norm))
+            key = self.norm_k(self.attn_key(x_norm))
             value = self.attn_value(x_norm)
 
             # Apply rotary position embedding if provided
@@ -127,7 +135,7 @@ class DiTBlock(nn.Module):
             value = value.view(batch_size, seq_len, self.num_heads, -1).transpose(1, 2)
 
             attn_output = F.scaled_dot_product_attention(
-                query, key, value, attn_mask=attention_mask, dropout_p=0.0
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0,is_causal=False
             )
             attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
             attn_output = self.attn_output(attn_output)
@@ -137,8 +145,8 @@ class DiTBlock(nn.Module):
         # Cross-attention (only for "cross" and "both")
         if self.attention_type in ["cross", "both"] and encoder_hidden_states is not None:
             x_norm = self.norm_cross(x)
-            cross_query = self.cross_attn_query(x_norm)
-            cross_key = self.cross_attn_key(encoder_hidden_states)
+            cross_query = self.norm_cross_q(self.cross_attn_query(x_norm))
+            cross_key = self.norm_cross_k(self.cross_attn_key(encoder_hidden_states))
             cross_value = self.cross_attn_value(encoder_hidden_states)
 
             batch_size, ctx_len, _ = cross_query.shape
@@ -147,7 +155,8 @@ class DiTBlock(nn.Module):
             cross_value = cross_value.view(batch_size, ctx_len, self.num_heads, -1).transpose(1, 2)
 
             cross_attn_output = F.scaled_dot_product_attention(
-                cross_query, cross_key, cross_value, attn_mask=cross_attention_mask, dropout_p=0.0
+                cross_query, cross_key, cross_value, attn_mask=cross_attention_mask, dropout_p=0.0,
+                is_causal=False
             )
             cross_attn_output = cross_attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
             cross_attn_output = self.cross_attn_output(cross_attn_output)
@@ -184,7 +193,7 @@ class ActionRotaryPosEmbed(nn.Module):
     def forward(self, hidden_states: torch.Tensor, seq_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = hidden_states.size(0)
         dim = hidden_states.size(-1)
-        dtype = hidden_states.dtype  # Preserve input dtype
+        dtype = hidden_states.dtype 
 
         grid = torch.arange(seq_length, dtype=dtype, device=hidden_states.device).unsqueeze(0)
         grid = grid / self.base_seq_length
